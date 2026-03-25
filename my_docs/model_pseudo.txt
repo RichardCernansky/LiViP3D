@@ -1,0 +1,329 @@
+=== ViP3D FORWARD PASS PSEUDOCODE ===
+
+INPUT:
+    img         : (1, T, 6, 3, H, W)   — T frames, 6 cameras
+    radar       : (1, T, num_pts, 13)
+    gt_bboxes   : list of T frames of GT boxes
+    gt_labels   : list of T frames of GT labels
+    instance_inds: list of T frames of GT object IDs (from nuScenes annotations)
+    l2g_r_mat   : (T, 3, 3)  — rotation matrices lidar→global per frame
+    l2g_t       : (T, 1, 3)  — translation vectors lidar→global per frame
+    timestamps  : (T,)
+
+═══════════════════════════════════════════════════════
+BEFORE FIRST FRAME
+═══════════════════════════════════════════════════════
+
+query_embedding = nn.Embedding(300, 512)       # learned weights
+reference_points_mlp = nn.Linear(256, 3)       # learned weights
+bbox_size_fc = nn.Linear(256, 3)               # learned weights
+
+track_instances.query     = query_embedding.weight          # (300, 512)
+track_instances.ref_pts   = reference_points_mlp(query[:, :256])  # (300, 3)
+track_instances.pred_boxes = zeros(300, 10)
+    pred_boxes[:, 2:4] = bbox_size_fc(query[:, :256])[:, 0:2]  # init wl
+    pred_boxes[:, 5:6] = bbox_size_fc(query[:, :256])[:, 2:3]  # init h
+track_instances.output_embedding = zeros(300, 256)
+track_instances.obj_idxes        = full(-1, 300)
+track_instances.matched_gt_idxes = full(-1, 300)
+track_instances.scores           = zeros(300)
+track_instances.pred_logits      = zeros(300, 7)
+track_instances.mem_bank         = zeros(300, 4, 256)
+track_instances.mem_padding_mask = ones(300, 4)     # True = empty slot
+track_instances.disappear_time   = zeros(300)
+track_instances.save_period      = zeros(300)
+
+criterion.initialize_for_single_clip(gt_instances_list)
+loss_total.backward()    # gradients flow through entire clip in one shot
+optimizer.step()
+
+    # stores all T frames of GT for loss computation
+
+
+═══════════════════════════════════════════════════════
+FOR EACH FRAME t in (0 .. T-1):
+═══════════════════════════════════════════════════════
+
+────────────────────────────────────────────
+STEP 1 — EXTRACT IMAGE AND RADAR FEATURES
+────────────────────────────────────────────
+
+img_feats = ResNet50(img[t])               # 4 FPN levels
+    # each level: (1, 6, 256, H_l, W_l)
+
+FOR each FPN level i:
+    FOR each camera n:
+        img_feats[i][:, n] += cam_embed[n]     # camera tag (256D learned vector)
+    img_feats[i] += level_embed[i]             # level tag  (256D learned vector)
+    img_feats[i] += sine_positional_encoding   # 2D spatial position
+
+radar_feats = RadarPointEncoder(radar[t])  # (1, num_pts, radar_dim)
+
+
+────────────────────────────────────────────
+STEP 2 — DETECTION HEAD (6 DECODER LAYERS)
+────────────────────────────────────────────
+
+ref_box_sizes = track_instances.pred_boxes[:, [2,3,5]]  # wlh from previous frame
+
+# --- 6 decoder layers ---
+FOR layer l in (0 .. 5):
+
+    # --- SELF-ATTENTION among queries ---
+    q = k = track_instances.query
+    tgt2 = MultiheadAttention(q, k, value=query)
+    query = norm(query + tgt2)
+
+    # --- CROSS-ATTENTION to image features ---
+    FOR each query j in (0 .. 299):
+
+        # project 3D ref_pt into all 6 cameras
+        ref_pt_meters = unnormalize(ref_pts[j])     # [0,1] → meters
+        FOR each camera n:
+            pixel[n] = lidar2img[n] @ [ref_pt_meters, 1]  # 3D → 2D
+            valid[n] = (pixel[n].z > 0) AND (pixel[n] in image bounds)
+
+        # sample features at projected pixels
+        FOR each camera n, each FPN level k:
+            sampled[n,k] = bilinear_sample(img_feats[k][:, n], pixel[n])
+            # sampled[n,k] shape: (256,)
+
+        # predict attention weights from query content
+        attn_weights = sigmoid(Linear_256_to_24(query[j]))  # 6cams × 4levels × 1
+        attn_weights *= validity_mask                        # zero out invalid cameras
+
+        # weighted sum
+        output_embed[j] = sum(attn_weights * sampled)       # (256,)
+        output_embed[j] += position_encoder(ref_pts[j])     # add 3D position
+
+    query = norm(query + output_embed)     # residual
+    query = norm(query + FFN(query))       # FFN
+
+    # --- RADAR FUSION (if using Detr3DCamRadarCrossAtten) ---
+    FOR each query j:
+        find top-8 radar points closest to ref_pts[j] in XY
+        radar_weights = sigmoid(Linear(query[j]))  # 8 weights
+        radar_out[j]  = weighted_sum(top8_radar_feats)
+    query = img_radar_fusion(cat(query, radar_out))  # Linear(256+radar_dim → 256)
+
+    # --- DECODE BOX from query ---
+    class_logits[l]  = cls_branch[l](query)        # (300, 7)
+    delta_xywlzh     = reg_branch[l](query)        # (300, 6)
+    direction[l]     = direction_branch[l](query)  # (300, 2) sin,cos
+    velocity[l]      = velo_branch[l](query)       # (300, 2) vx,vy
+
+    # residual update to reference point
+    ref_pts[:, 0:2] = sigmoid(ref_pts[:, 0:2] + delta_xywlzh[:, 0:2])  # xy
+    ref_pts[:, 2:3] = sigmoid(ref_pts[:, 2:3] + delta_xywlzh[:, 4:5])  # z
+
+    # decode box dimensions
+    wlh[l] = delta_xywlzh[:, 2:4,5:6] + ref_box_sizes   # residual on size
+
+    output_coords[l] = cat(ref_pts_meters, wlh, direction, velocity)  # (300, 10)
+
+# outputs:
+# output_classes : (6, 1, 300, 7)
+# output_coords  : (6, 1, 300, 10)
+# query_feats    : (1, 300, 256)   ← query state after layer 6
+# last_ref_pts   : (1, 300, 3)     ← ref_pts after layer 6
+
+
+────────────────────────────────────────────
+STEP 3 — TRACK SCORES
+────────────────────────────────────────────
+
+track_scores = sigmoid(output_classes[-1, 0, :]).max(dim=-1)  # (300,)
+# used by: RuntimeTrackerBase, memory bank, QIM fp selection
+# NOT used for loss
+
+
+────────────────────────────────────────────
+STEP 4 — STORE OUTPUT EMBEDDING
+────────────────────────────────────────────
+
+track_instances.output_embedding = query_feats[0]   # (300, 256)
+# this is the rich per-query representation after seeing this frame
+# used by: memory bank, VectorNet predictor
+
+
+────────────────────────────────────────────
+STEP 5 — VELOCITY UPDATE
+────────────────────────────────────────────
+
+velo = output_coords[-1, 0, :, -2:]   # (300, 2) — vx, vy from last layer
+
+IF not last frame:
+    ref_pts = velo_update(last_ref_pts[0], velo, l2g_r1, l2g_t1, l2g_r2, l2g_t2, dt)
+        # 1. unnormalize ref_pts: [0,1] → meters
+        # 2. move: pos += velo × dt
+        # 3. transform to next frame coords:
+        #       pos = pos @ l2g_r1.T + l2g_t1    (lidar_t → global)
+        #       pos = (pos - l2g_t2) @ inv(l2g_r2).T  (global → lidar_t+1)
+        # 4. renormalize: meters → [0,1] → inverse_sigmoid
+ELSE:
+    ref_pts = last_ref_pts[0]
+
+track_instances.ref_pts = ref_pts   # (300, 3) — ready for next frame
+
+
+────────────────────────────────────────────
+STEP 6 — MATCHING + LOSS  (×6 decoder layers)
+────────────────────────────────────────────
+
+FOR layer l in (0 .. 5):
+
+    track_instances.pred_logits = output_classes[l, 0]   # (300, 7)
+    track_instances.pred_boxes  = output_coords[l, 0]    # (300, 10)
+
+    # --- part A: update already-tracked queries ---
+    build dict: obj_idx_to_gt_idx from current frame GT obj_ids
+
+    FOR each query j in (0 .. 299):
+        IF obj_idxes[j] >= 0:                        # currently tracking something
+            IF obj_idxes[j] in obj_idx_to_gt_idx:
+                matched_gt_idxes[j] = obj_idx_to_gt_idx[obj_idxes[j]]  # still there
+            ELSE:
+                matched_gt_idxes[j] = -1              # object disappeared
+        ELSE:
+            matched_gt_idxes[j] = -1                  # was empty, stays empty
+
+    # --- part B: Hungarian matching for new objects ---
+    unmatched_queries = queries where obj_idxes == -1
+    untracked_GTs     = GT objects not in any matched_gt_idxes
+
+    cost_matrix = 2.0 × focal_loss_cost(pred_logits, GT_labels)
+                + 0.25 × L1_cost(pred_boxes, GT_boxes)
+
+    src_idx, tgt_idx = linear_sum_assignment(cost_matrix)
+
+    obj_idxes[src_idx]        = GT_obj_ids[tgt_idx]    # assign new track IDs
+    matched_gt_idxes[src_idx] = tgt_idx
+
+    # --- part C: compute loss ---
+    matched_indices = cat(new_matches, previous_matches)
+
+    loss_cls  = FocalLoss(pred_logits, GT_labels_or_background)
+                # matched   → GT class
+                # unmatched → background (class index 7)
+
+    loss_bbox = L1Loss(pred_boxes[matched], GT_boxes[matched])
+                × code_weights[1,1,1,1,1,1,1,1,0.2,0.2]
+                # disappeared tracks excluded
+
+    losses_dict["frame_{t}_loss_cls_{l}"]  = loss_cls
+    losses_dict["frame_{t}_loss_bbox_{l}"] = loss_bbox
+
+# step the frame counter after last decoder layer
+
+
+────────────────────────────────────────────
+STEP 7 — MEMORY BANK
+────────────────────────────────────────────
+
+track_instances = memory_bank(track_instances)
+
+    # --- part A: temporal attention ---
+    valid_queries = queries where mem_padding_mask[:, -1] == False
+                    # i.e. have at least one saved embedding
+
+    FOR each valid query j:
+        Q     = output_embedding[j]          # (1, 256) — current frame
+        K = V = mem_bank[j]                  # (4, 256) — past 4 frames
+
+        # MultiheadAttention (8 heads, 32D each)
+        scores  = Q @ K.T / sqrt(32)         # (1, 4) — similarity to each past frame
+        weights = softmax(scores)            # (1, 4) e.g. [0.6, 0.25, 0.1, 0.05]
+        embed2  = weights @ V                # (1, 256) — weighted sum of past
+
+        output_embedding[j] = norm(output_embedding[j] + embed2)   # residual
+        output_embedding[j] = norm(output_embedding[j] + FFN(output_embedding[j]))
+
+    # --- part B: save to buffer ---
+    IF training:
+        save_queries = queries where scores > 0
+    ELSE:
+        save_queries = queries where (save_period==0) AND (scores > save_thresh)
+        save_period[save_queries] = 3        # save every 3 frames at inference
+
+    FOR each query j in save_queries:
+        saved_embed = save_proj(output_embedding[j])   # Linear(256→256)
+        mem_bank[j] = cat(mem_bank[j, 1:], saved_embed)  # shift left, push new
+        mem_padding_mask[j] = cat(mem_padding_mask[j, 1:], [False])  # mark valid
+
+
+────────────────────────────────────────────
+STEP 8 — QIM (Query Interaction Module)
+────────────────────────────────────────────
+
+    # --- part A: select active queries ---
+    IF training:
+        active = track_instances[obj_idxes >= 0]
+        active = random_drop(active, p=0.1)          # drop 10% randomly
+        active = add_fp_tracks(active, inactive, fp_ratio=0.3)
+            # add some high-scoring inactive queries as hard negatives
+    ELSE:
+        active = track_instances[obj_idxes >= 0]
+
+    # --- part B: self-attention among active queries ---
+    query_pos  = active.query[:, :256]
+    query_feat = active.query[:, 256:]
+    out_embed  = active.output_embedding
+
+    q = k = query_pos + out_embed     # combine position + current output
+    tgt2 = MultiheadAttention(q, k, value=out_embed)  # queries see each other
+    tgt  = norm(out_embed + tgt2)                      # residual
+    tgt  = norm(tgt + FFN(tgt))                        # FFN
+
+    # --- part C: update query vector for next frame ---
+    query_pos  = norm(query_pos  + MLP_pos(tgt))    # two-layer MLP
+    query_feat = norm(query_feat + MLP_feat(tgt))   # two-layer MLP
+
+    active.query = cat(query_pos, query_feat)        # (num_active, 512)
+
+    RETURN active   # only active queries, empty ones discarded
+
+
+────────────────────────────────────────────
+STEP 9 — REFILL EMPTY SLOTS
+────────────────────────────────────────────
+
+fresh_empty = generate_empty_tracks()     # 300 fresh slots from learned embeddings
+track_instances = cat(active, fresh_empty)
+# back to 300 total for next frame
+
+
+═══════════════════════════════════════════════════════
+AFTER ALL T FRAMES — TRAJECTORY PREDICTION
+═══════════════════════════════════════════════════════
+
+agents_indices = queries where obj_idxes >= 0    # matched queries only
+
+output_embedding = track_instances.output_embedding[agents_indices]
+# (num_agents, 256) — enriched with visual + temporal history
+
+# VectorNet
+map_features = VectorNet_SubGraph(HD_map_lanes)  # encode lane polylines
+agents       = MLP(output_embedding)             # project to predictor space
+
+# agent-map cross attention
+agents = attend(agents, map_features)
+
+# decode 6 future trajectories per agent
+trajectories = MLP_decoder(agents)
+# (num_agents, 6_modes, 12_frames, 2_coords)
+
+# variety loss — only penalize closest predicted mode to GT
+FOR each agent:
+    distances = L2(trajectories[:, -1, :], GT_trajectory[-1, :])  # at final frame
+    best_mode = argmin(distances)
+    loss_traj += smooth_L1(trajectories[best_mode], GT_trajectory)
+    loss_prob += NLL(mode_probs, best_mode)
+
+losses_dict["prediction_loss"] = loss_traj + loss_prob
+
+
+═══════════════════════════════════════════════════════
+BACKPROPAGATION
+═══════════════════════════════════════════════════════
+
+loss_total = sum(all losses_dict values) / num_GT_objects_across_all_frames

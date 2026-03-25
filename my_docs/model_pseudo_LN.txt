@@ -1,0 +1,236 @@
+=== PER SCENE INIT ===
+# vip3d.py:309-359  _generate_empty_tracks()
+track_instances.query    = nn.Embedding(300, 512).weight       # vip3d.py:142-143, 316
+track_instances.ref_pts  = nn.Linear(256, 3)(query[:, :256])   # vip3d.py:144, 327
+track_instances.output_embedding = zeros(300, 256)             # vip3d.py:330-331
+track_instances.obj_idxes        = full(300, -1)               # vip3d.py:333-334
+track_instances.mem_bank         = zeros(300, 4, 256)          # vip3d.py:352-354
+track_instances.mem_padding_mask = ones(300, 4, bool)          # vip3d.py:355-357
+
+
+=== FOR EACH FRAME  ===  vip3d.py:405  _forward_single()
+
+		--- STEP 1: Extract image features ---
+		# vip3d.py:424-425
+		img_feats = backbone(img) + neck(img)   # [4 FPN levels, shape (B,6,C,H,W)]
+
+		--- STEP 2: Detection head (transformer decoder, 6 layers) ---
+		# vip3d.py:435-438  pts_bbox_head()  →  head_plus_raw.py:141
+		# head_plus_raw.py:177-189: ADD positional + level + cam encodings to img_feats
+		# head_plus_raw.py:197-205: 6-layer deformable transformer decoder
+		#   each layer: attention_dert3d.py:118-194
+		#     project ref_pts (3D) → 6 cameras  (attention_dert3d.py:447-452)
+		#     sample features with F.grid_sample (attention_dert3d.py:467-473)
+		#     predict attention weights (attention_dert3d.py:177-178)
+		#     weighted sum → aggregated query feature (attention_dert3d.py:185-187)
+		#   MLP predicts delta → update ref_pts  (head_plus_raw.py:221, 227-230)
+		output_classes  # [6, B, 300, num_cls]
+		output_coords   # [6, B, 300, 10]
+		query_feats     # [B, 300, 256]  ← output_embedding from last decoder layer
+		last_ref_pts    # [B, 300, 3]    ← refined reference points (inverse sigmoid)
+
+		--- STEP 3: Store detection output ---
+		# vip3d.py:457
+		track_instances.output_embedding = query_feats[0]   # [300, 256]
+
+		--- STEP 4: Velocity update (geometry, no learning) ---
+		# vip3d.py:461-467   velo_update()  →  vip3d.py:195-235
+		velo = output_coords[-1, 0, :, -2:]                 # [300, 2]
+		track_instances.ref_pts = velo_update(last_ref_pts, velo, l2g_r1, l2g_t1, l2g_r2, l2g_t2)
+		#   ref_pts += velo * time_delta                    # vip3d.py:224
+		#   transform lidar_t1 → global → lidar_t2         # vip3d.py:226-227
+		#   back to inverse sigmoid space                   # vip3d.py:233
+
+		--- STEP 5: Store scores and predictions on all 300 queries ---
+		# vip3d.py:448, 475-477
+		track_instances.scores      = output_classes[-1].sigmoid().max(-1).values
+		track_instances.pred_logits = output_classes[i, 0]   # per decoder layer copy
+		track_instances.pred_boxes  = output_coords[i, 0]
+
+		--- STEP 6: Hungarian matching (assigns obj_idxes) ---
+		# vip3d.py:481-482   criterion.match_for_single_frame()  →  loss.py:248
+		# For last decoder layer:
+		#   cost matrix = cls_cost + bbox_cost + iou_cost   (loss.py:299-312)
+		#   scipy.linear_sum_assignment                     (loss.py:319)
+		#   track_instances.obj_idxes[matched] = gt obj_id  (loss.py:330-340)
+		#   track_instances.matched_gt_idxes   = gt index
+
+		--- STEP 7: Memory bank ---
+		# vip3d.py:484-485   memory_bank()  →  memory_bank.py:92
+		track_instances = memory_bank(track_instances)
+
+			# Part A: temporal attention  memory_bank.py:62-87
+			valid = queries where mem_padding_mask[:, -1] == False  # memory_bank.py:68
+			#   i.e. have at least one saved embedding in buffer
+			Q = track_instances.output_embedding[valid]             # (n, 256)  memory_bank.py:69
+			K = V = track_instances.mem_bank[valid]                 # (n, 4, 256) memory_bank.py:72
+			embed2 = MultiheadAttention(Q, K, V)                    # memory_bank.py:74-79
+			track_instances.output_embedding[valid] = norm(Q + embed2)            # memory_bank.py:81
+			track_instances.output_embedding[valid] = norm(out + FFN(out))        # memory_bank.py:82-83
+
+			# Part B: save to buffer  memory_bank.py:39-60
+			saved = queries where scores > thresh                   # memory_bank.py:47/49
+			save_embed = save_proj(output_embedding[saved])         # memory_bank.py:57
+			mem_bank[saved] = roll left, append save_embed          # memory_bank.py:60
+			mem_padding_mask[saved] updated accordingly             # memory_bank.py:58
+
+		--- STEP 8: QIM — query interaction module ---
+		# vip3d.py:488-489   query_interact()  →  qim.py:178
+		active = track_instances[obj_idxes >= 0]   # qim.py:167,174  (training vs inference)
+
+			# _update_track_embedding  qim.py:92-125
+			out_embed  = active.output_embedding     # already temporally enriched from Step 7
+			query_pos  = active.query[:, :256]
+			query_feat = active.query[:, 256:]
+			q = k = query_pos + out_embed
+			tgt = out_embed
+			tgt = norm(tgt + SelfAttention(q, k, tgt))              # qim.py:103-105
+			tgt = norm(tgt + FFN(tgt))                              # qim.py:108-110
+			active.query[:, :256] = norm(query_pos + linear(tgt))   # qim.py:114-117  (if update_query_pos)
+			active.query[:, 256:] = norm(query_feat + linear(tgt))  # qim.py:119-122
+
+		RETURN active   # these become track_instances for next frame
+		# active.query    → used as queries input to detector next frame  (vip3d.py:437)
+		# active.ref_pts  → used as reference points next frame           (vip3d.py:438)
+
+
+────────────────────────────────────────────
+STEP 9 — REFILL EMPTY SLOTS
+────────────────────────────────────────────
+
+fresh_empty = generate_empty_tracks()     # 300 fresh slots from learned embeddings
+track_instances = cat(active, fresh_empty)
+# back to 300 total for next frame
+
+
+═══════════════════════════════════════════════════════
+AFTER ALL T FRAMES — TRAJECTORY PREDICTION
+═══════════════════════════════════════════════════════
+
+agents_indices = queries where obj_idxes >= 0    # matched queries only
+
+output_embedding = track_instances.output_embedding[agents_indices]
+# (num_agents, 256) — enriched with visual + temporal history
+
+# VectorNet
+map_features = VectorNet_SubGraph(HD_map_lanes)  # encode lane polylines
+agents       = MLP(output_embedding)             # project to predictor space
+
+# agent-map cross attention
+agents = attend(agents, map_features)
+
+# decode 6 future trajectories per agent
+trajectories = MLP_decoder(agents)
+# (num_agents, 6_modes, 12_frames, 2_coords)
+
+# variety loss — only penalize closest predicted mode to GT
+FOR each agent:
+    distances = L2(trajectories[:, -1, :], GT_trajectory[-1, :])  # at final frame
+    best_mode = argmin(distances)
+    loss_traj += smooth_L1(trajectories[best_mode], GT_trajectory)
+    loss_prob += NLL(mode_probs, best_mode)
+
+losses_dict["prediction_loss"] = loss_traj + loss_prob
+
+
+═══════════════════════════════════════════════════════
+BACKPROPAGATION
+═══════════════════════════════════════════════════════
+
+loss_total = sum(all losses_dict values) / num_GT_objects_across_all_frames
+loss_total.backward()    # gradients flow through entire clip in one shot
+optimizer.step()
+
+
+What TransFusion does:
+
+		Takes LiDAR point cloud → 3D backbone → BEV feature map
+		Heatmap head on BEV features → class-specific heatmap predicting object centers per category
+		Local maximum suppression → select top-K peaks across all classes
+		Each peak position → ref_pts in 3D space (free, BEV is already top-down 3D)
+		BEV feature at peak location + category embedding → query feature (input-dependent, category-aware)
+		First decoder layer: queries cross-attend to LiDAR BEV features → initial bounding boxes
+		Second decoder layer: queries cross-attend to image features → final predictions
+
+What ViP3D does:
+
+		Maintains 300 persistent query slots across frames
+		Empty slots initialized from fixed nn.Embedding — same weights every frame regardless of scene content
+		Queries fed into 6-layer transformer decoder cross-attending to 6 camera image features
+		Hungarian matching assigns object identities to queries after detection
+		Memory bank enriches active queries with temporal information from past 4 frames
+		QIM updates query vectors via self-attention among active queries for next frame
+		Active slots carry forward across frames enabling tracking
+		Empty slots sit idle with fixed learned initialization until a new object is matched
+		The proposed integration:
+
+Fixed nn.Embedding initialization of empty slots replaced by TransFusion-style LiDAR heatmap initialization
+Each frame: LiDAR point cloud → 3D backbone → BEV features → heatmap head → top-K peaks
+Empty slots filled with: peak positions as ref_pts + BEV features + category embeddings as query vectors
+Active slots (obj_idxes >= 0) completely unaffected — carry forward through QIM as before
+All 300 queries (active + newly initialized empty) fed into ViP3D's existing 6-layer image decoder
+ViP3D's image decoder plays the same role as TransFusion's second decoder layer
+LiDAR heatmap init replaces both TransFusion's first decoder layer and ViP3D's fixed embedding
+Full tracking pipeline — matching, memory bank, QIM — remains completely unchanged
+Result: TransFusion's input-dependent query initialization combined with ViP3D's temporal tracking
+
+
+1. vip3d.py:141-144 — __init__() — remove fixed init, add new modules:
+# REMOVE these:
+self.query_embedding = nn.Embedding(self.num_query, self.embed_dims * 2)
+self.reference_points = nn.Linear(self.embed_dims, 3)
+
+# ADD these:
+self.lidar_backbone = VoxelNet(...)          # processes LiDAR → BEV features
+self.heatmap_head = nn.Conv2d(...)           # BEV features → class heatmap
+self.category_embeds = nn.Embedding(num_classes, embed_dims)  # category-aware
+
+
+
+2. vip3d.py:309-359 — _generate_empty_tracks() — remove fixed init:
+# REMOVE these lines:
+query = self.query_embedding.weight          # vip3d.py:316
+track_instances.ref_pts = self.reference_points(query[..., :dim // 2])  # vip3d.py:327
+track_instances.query = query                # vip3d.py:328
+
+# empty slots now start with zeros, will be filled in _forward_single
+
+
+3. vip3d.py:424-438 — _forward_single() — add heatmap init before detector:
+# existing:
+img_feats, radar_feats, pts_feats = self.extract_feat(...)   # vip3d.py:424
+
+# ADD after extract_feat:
+bev_feats = self.lidar_backbone(lidar_points)                # new
+heatmap = self.heatmap_head(bev_feats)                       # new
+ref_pts, query_feats = self.select_topk_from_heatmap(heatmap, bev_feats)  # new
+
+# fill only empty slots:
+empty = track_instances.obj_idxes < 0                        # new
+track_instances.ref_pts[empty] = ref_pts[empty]              # new
+track_instances.query[empty, :256] = query_feats[empty]      # new (pos half)
+track_instances.query[empty, 256:] = query_feats[empty]      # new (feat half)
+
+# existing — unchanged:
+self.pts_bbox_head(img_feats, radar_feats, track_instances.query, ...)  # vip3d.py:435
+
+
+4. New helper method select_topk_from_heatmap() — add to vip3d.py:
+
+def select_topk_from_heatmap(self, heatmap, bev_feats):
+    # local maximum suppression
+    # select top-N peaks across all classes
+    # for each peak: get position → ref_pts, get bev_feats at position + category_embed → query
+    # return ref_pts [300, 3], query_feats [300, 256]
+
+
+5. vip3d_resnet50_3frame.py:20-25 — config — enable LiDAR:
+
+
+input_modality = dict(
+    use_lidar=True,    # change False → True
+    use_camera=True,
+    use_radar=False,
+    ...)
+
+# also add lidar_backbone config to model dict

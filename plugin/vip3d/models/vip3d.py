@@ -13,6 +13,8 @@ from mmdet.models import DETECTORS
 from mmdet.models import build_loss
 from pyquaternion import Quaternion
 
+import torch.nn.functional as F
+
 from mmdet3d.core.bbox.coders import build_bbox_coder
 from ...mmdet3d_plugin.core.bbox.util import normalize_bbox, denormalize_bbox
 from mmdet3d.models.detectors.mvx_two_stage import MVXTwoStageDetector
@@ -86,6 +88,12 @@ class ViP3D(MVXTwoStageDetector):
                  embed_dims=256,
                  num_query=300,
                  num_classes=7,
+                 # NEW 
+                use_lidar=False,
+                lidar_bev_channels=256,
+                lidar_voxel_size=None,
+                lidar_out_size_factor=4,
+                # END NEW
                  bbox_coder=None,
                  qim_args=None,
                  mem_cfg=None,
@@ -138,10 +146,25 @@ class ViP3D(MVXTwoStageDetector):
             self.img_neck.eval()
         self.bbox_size_fc = nn.Linear(self.embed_dims, 3)
 
-        if True:
-            self.query_embedding = nn.Embedding(self.num_query,
-                                                self.embed_dims * 2)
+        self.use_lidar = use_lidar
+        if not self.use_lidar:
+            # Original: fixed learnable query embeddings
+            self.query_embedding = nn.Embedding(self.num_query, self.embed_dims * 2)
             self.reference_points = nn.Linear(self.embed_dims, 3)
+        else:
+            # LiViP3D: input-dependent init from LiDAR heatmap peaks
+            self.lidar_bev_channels = lidar_bev_channels
+            self.lidar_voxel_size = lidar_voxel_size 
+            self.lidar_out_size_factor = lidar_out_size_factor
+            self.category_embeds = nn.Embedding(num_classes, embed_dims)
+            self.heatmap_head = nn.Sequential(
+                nn.Conv2d(lidar_bev_channels, lidar_bev_channels, 3, padding=1),
+                nn.BatchNorm2d(lidar_bev_channels),
+                nn.ReLU(inplace=True),
+                nn.Conv2d(lidar_bev_channels, num_classes, 1),
+            )
+            # Projects BEV channels → embed_dims for query content vector
+            self.lidar_bev_proj = nn.Linear(lidar_bev_channels, embed_dims)
 
         self.track_base = RuntimeTrackerBase(
             score_thresh=score_thresh,
@@ -295,7 +318,12 @@ class ViP3D(MVXTwoStageDetector):
                 img_feats = self.extract_img_feat(img, img_metas)
         else:
             img_feats = self.extract_img_feat(img, img_metas)
-        return (img_feats, radar_feats, None)
+
+        bev_feats = None
+        if self.use_lidar and points is not None:
+            bev_feats = self.extract_pts_feat(points, img_feats, img_metas)
+
+        return (img_feats, radar_feats, bev_feats)
 
     def _targets_to_instances(self, gt_bboxes_3d=None,
                               gt_labels_3d=None, instance_inds=None,
@@ -308,61 +336,58 @@ class ViP3D(MVXTwoStageDetector):
 
     def _generate_empty_tracks(self, proposals=None):
         track_instances = Instances((1, 1))
-        num_queries, dim = self.query_embedding.weight.shape  # (300, 256 * 2)
-        device = self.query_embedding.weight.device
+        num_queries = self.num_query
+        dim = self.embed_dims * 2
+        device = self.bbox_size_fc.weight.device  # always exists, no query_embedding dependency
 
-        # query is learnable embedding
-        # ref_pts is decoded from query by nn.Linear(self.embed_dims, 3)
-        query = self.query_embedding.weight
+        if not self.use_lidar:
+            query = self.query_embedding.weight          # (300, 512) learnable
+            ref_pts = self.reference_points(query[..., :dim // 2])
+        else:
+            # Zeros — will be filled per-frame in _forward_single from heatmap
+            query = torch.zeros((num_queries, dim), dtype=torch.float, device=device)
+            ref_pts = torch.zeros((num_queries, 3), dtype=torch.float, device=device)
 
-        # init boxes: xy, wl, z, h, sin, cos, vx, vy, vz
+        # init box sizes from content half of query
         box_sizes = self.bbox_size_fc(query[..., :dim // 2])
-        pred_boxes_init = torch.zeros(
-            (len(query), 10), dtype=torch.float, device=device)
-
+        pred_boxes_init = torch.zeros((num_queries, 10), dtype=torch.float, device=device)
         pred_boxes_init[..., 2:4] = box_sizes[..., 0:2]
         pred_boxes_init[..., 5:6] = box_sizes[..., 2:3]
 
-        if True:
-            track_instances.ref_pts = self.reference_points(query[..., :dim // 2])
-            track_instances.query = query
+        track_instances.ref_pts = ref_pts
+        track_instances.query = query
 
         track_instances.output_embedding = torch.zeros(
-            (len(track_instances), dim >> 1), device=device)
-
+            (num_queries, dim >> 1), device=device)
         track_instances.obj_idxes = torch.full(
-            (len(track_instances),), -1, dtype=torch.long, device=device)
+            (num_queries,), -1, dtype=torch.long, device=device)
         track_instances.matched_gt_idxes = torch.full(
-            (len(track_instances),), -1, dtype=torch.long, device=device)
+            (num_queries,), -1, dtype=torch.long, device=device)
         track_instances.disappear_time = torch.zeros(
-            (len(track_instances),), dtype=torch.long, device=device)
-
+            (num_queries,), dtype=torch.long, device=device)
         track_instances.scores = torch.zeros(
-            (len(track_instances),), dtype=torch.float, device=device)
+            (num_queries,), dtype=torch.float, device=device)
         track_instances.track_scores = torch.zeros(
-            (len(track_instances),), dtype=torch.float, device=device)
-        # xy, wl, z, h, sin, cos, vx, vy, vz
+            (num_queries,), dtype=torch.float, device=device)
         track_instances.pred_boxes = pred_boxes_init
-
         track_instances.pred_logits = torch.zeros(
-            (len(track_instances), self.num_classes),
-            dtype=torch.float, device=device)
+            (num_queries, self.num_classes), dtype=torch.float, device=device)
 
         mem_bank_len = self.mem_bank_len
         track_instances.mem_bank = torch.zeros(
-            (len(track_instances), mem_bank_len, dim // 2),
-            dtype=torch.float32, device=device)
+            (num_queries, mem_bank_len, dim // 2), dtype=torch.float32, device=device)
         track_instances.mem_padding_mask = torch.ones(
-            (len(track_instances), mem_bank_len),
-            dtype=torch.bool, device=device)
+            (num_queries, mem_bank_len), dtype=torch.bool, device=device)
         track_instances.save_period = torch.zeros(
-            (len(track_instances),), dtype=torch.float32, device=device)
+            (num_queries,), dtype=torch.float32, device=device)
 
         return track_instances.to(device)
 
+
     def _copy_tracks_for_loss(self, tgt_instances):
 
-        device = self.query_embedding.weight.device
+        device = self.bbox_size_fc.weight.device
+        
         track_instances = Instances((1, 1))
 
         track_instances.obj_idxes = deepcopy(tgt_instances.obj_idxes)
@@ -380,7 +405,7 @@ class ViP3D(MVXTwoStageDetector):
             dtype=torch.float, device=device)
 
         track_instances.save_period = deepcopy(tgt_instances.save_period)
-        return track_instances.to(self.query_embedding.weight.device)
+        return track_instances.to(self.bbox_size_fc.weight.device)
 
     @force_fp32(apply_to=('img', 'points'))
     def forward(self, return_loss=True, **kwargs):
@@ -420,22 +445,59 @@ class ViP3D(MVXTwoStageDetector):
 
         B, num_cam, _, H, W = img.shape
 
+        #always run
         if True:
             img_feats, radar_feats, pts_feats = self.extract_feat(
                 points, img=img, radar=radar, img_metas=img_metas)
-            # img_feats = [a.clone() for a in img_feats]
-
-            # output_classes: [num_dec, B, num_query, num_classes]
-            # query_feats: [B, num_query, embed_dim]
 
             ref_box_sizes = torch.cat(
                 [track_instances.pred_boxes[:, 2:4],
-                 track_instances.pred_boxes[:, 5:6]], dim=1)
+                track_instances.pred_boxes[:, 5:6]], dim=1)
 
-            output_classes, output_coords, \
-                query_feats, last_ref_pts = self.pts_bbox_head(
-                img_feats, radar_feats, track_instances.query,
-                track_instances.ref_pts, ref_box_sizes, img_metas, )
+        # ── LiViP3D: fill empty slots + heatmap loss 
+        if self.use_lidar and pts_feats is not None:
+            bev_feat = pts_feats[0] if isinstance(pts_feats, (list, tuple)) else pts_feats
+            heatmap  = self.heatmap_head(bev_feat)          # [B, num_classes, H, W]
+
+            # 1. fill empty slots
+            empty_mask = track_instances.obj_idxes < 0
+            num_empty  = int(empty_mask.sum())
+            if num_empty > 0:
+                active_ref = track_instances.ref_pts[track_instances.obj_idxes >= 0] \
+                            if (track_instances.obj_idxes >= 0).any() else None
+                new_ref_pts, new_queries = self.select_topk_from_heatmap(
+                    heatmap, bev_feat, num_select=num_empty, active_ref_pts=active_ref)
+                track_instances.ref_pts[empty_mask] = new_ref_pts
+                track_instances.query[empty_mask]   = new_queries
+
+            # 2. heatmap supervision — independent of whether any slots were filled
+            if self.training and gt_bboxes_3d is not None and gt_labels_3d is not None:
+                H_bev, W_bev = heatmap.shape[2], heatmap.shape[3]
+                boxes_t    = gt_bboxes_3d[0].tensor.to(bev_feat.device) \
+                            if hasattr(gt_bboxes_3d[0], 'tensor') else gt_bboxes_3d[0]
+                labels_t   = gt_labels_3d[0].to(bev_feat.device)
+                boxes_norm = normalize_bbox(boxes_t, self.pc_range)
+                gt_hm      = self._generate_gt_heatmap(
+                    boxes_norm, labels_t, H_bev, W_bev, bev_feat.device)   # [K, H, W]
+                pred_hm    = heatmap[0].sigmoid()
+
+                pos_mask    = gt_hm.eq(1).float()
+                neg_weights = torch.pow(1 - gt_hm, 4)
+                pos_loss = torch.log(pred_hm.clamp(min=1e-6)) * torch.pow(1 - pred_hm, 2) * pos_mask
+                neg_loss = torch.log((1 - pred_hm).clamp(min=1e-6)) * torch.pow(pred_hm, 2) \
+                        * neg_weights * gt_hm.lt(1).float()
+                num_pos  = pos_mask.sum().clamp(min=1)
+                heatmap_loss = -(pos_loss.sum() + neg_loss.sum()) / num_pos
+                frame_idx = self.criterion._current_frame_idx
+                self.criterion.losses_dict[f'frame_{frame_idx}_heatmap_loss'] = heatmap_loss
+        # ── end LiViP3D ──────────────────────────────────────────────────────────
+
+        # always runs regardless of use_lidar
+        output_classes, output_coords, \
+            query_feats, last_ref_pts = self.pts_bbox_head(
+            img_feats, radar_feats, track_instances.query,
+            track_instances.ref_pts, ref_box_sizes, img_metas)
+
 
         if self.add_branch:
             self.update_history_img_list(img_metas, img, img_feats)
@@ -754,6 +816,22 @@ class ViP3D(MVXTwoStageDetector):
             ref_box_sizes = torch.cat(
                 [track_instances.pred_boxes[:, 2:4],
                  track_instances.pred_boxes[:, 5:6]], dim=1)
+
+            # ── LiViP3D: fill empty query slots from LiDAR heatmap ──────────────────
+            if self.use_lidar and pts_feats is not None:
+                bev_feat = pts_feats[0] if isinstance(pts_feats, (list, tuple)) else pts_feats
+                heatmap  = self.heatmap_head(bev_feat)
+                empty_mask = track_instances.obj_idxes < 0
+                num_empty  = int(empty_mask.sum())
+                if num_empty > 0:
+                    active_ref = track_instances.ref_pts[track_instances.obj_idxes >= 0] \
+                                if (track_instances.obj_idxes >= 0).any() else None
+                    new_ref_pts, new_queries = self.select_topk_from_heatmap(
+                        heatmap, bev_feat, num_select=num_empty, active_ref_pts=active_ref)
+                    track_instances.ref_pts[empty_mask] = new_ref_pts
+                    track_instances.query[empty_mask]   = new_queries
+            # ── end LiViP3D ──────────────────────────────────────────────────────────
+
 
             output_classes, output_coords, \
                 query_feats, last_ref_pts = self.pts_bbox_head(
@@ -1132,3 +1210,160 @@ class ViP3D(MVXTwoStageDetector):
         assert query.shape == (len(output_embedding), 1, 256)
         query = query.squeeze(1)
         return query
+
+    def select_topk_from_heatmap(self, heatmap, bev_feat, num_select, active_ref_pts=None):
+        """
+        Select top-K object candidates from a BEV heatmap.
+
+        Args:
+            heatmap  (Tensor): [B, num_classes, H, W]  raw logits (pre-sigmoid)
+            bev_feat (Tensor): [B, C, H, W]            BEV feature map
+            num_select (int):  number of peaks to return (= number of empty slots)
+
+        Returns:
+            ref_pts    (Tensor): [num_select, 3]              inverse-sigmoid space
+            query_feats(Tensor): [num_select, embed_dims * 2] content + pos
+        """
+        B, num_classes, H, W = heatmap.shape
+        scores = heatmap.sigmoid()  # [B, K, H, W]
+
+        # Suppress heatmap cells at active track locations
+        if active_ref_pts is not None and len(active_ref_pts) > 0:
+            pc_range = self.pc_range
+            vs = self.lidar_voxel_size
+            sf = self.lidar_out_size_factor
+            anorm = active_ref_pts.sigmoid()
+            ax = anorm[:, 0] * (pc_range[3] - pc_range[0]) + pc_range[0]
+            ay = anorm[:, 1] * (pc_range[4] - pc_range[1]) + pc_range[1]
+            ac = ((ax - pc_range[0]) / (vs[0] * sf)).long().clamp(0, W - 1)
+            ar = ((ay - pc_range[1]) / (vs[1] * sf)).long().clamp(0, H - 1)
+            sup_r = 2
+            for r, c in zip(ar.tolist(), ac.tolist()):
+                r, c = int(r), int(c)
+                scores[:, :,
+                    max(0, r - sup_r):min(H, r + sup_r + 1),
+                    max(0, c - sup_r):min(W, c + sup_r + 1)] = 0.0
+
+
+        # Local-max suppression via 3×3 max-pool (keeps only local peaks).
+        # NuScenes 7 classes: 0=car,1=truck,2=bus,3=trailer,4=moto,5=bicycle,6=pedestrian
+        # Skip NMS for small classes (bicycle=5, pedestrian=6) as TransFusion does for
+        # pedestrian/traffic_cone.
+        SKIP_NMS = {5, 6}
+        scores_nms = scores.clone()
+        # for every cell, compute the maximum score in its 3x3 neighbourhood
+        heatmap_max = F.max_pool2d(scores, 3, stride=1, padding=1)
+        for c in range(num_classes):
+            if c not in SKIP_NMS: # skip dense objects
+                # a cell keeps its score only if it is the local maximum in 3x3 neighbourhood - otherwise 0
+                scores_nms[:, c] = scores[:, c] * (scores[:, c] == heatmap_max[:, c]).float()
+
+        # Flatten to [B, K*H*W] and take top-K across all classes
+        scores_flat = scores_nms.view(B, -1)           # [B, num_classes*H*W]
+        # select from all the anchors the topk=min(k, num_anchors) ones
+        topk_scores, topk_inds = scores_flat.topk(      # [B, num_select]
+            min(num_select, scores_flat.shape[-1]), dim=-1)
+
+        # get the info for each chosen topk query
+        topk_cls = topk_inds // (H * W)                # class index [B, num_select]
+        topk_hw  = topk_inds  % (H * W)
+        topk_h   = topk_hw // W                        # row    [B, num_select]
+        topk_w   = topk_hw  % W                        # column [B, num_select]
+
+        # (col, row) → metric (x, y) using voxel grid definition
+        pc_range  = self.pc_range
+        vs        = self.lidar_voxel_size              # [vx, vy, vz]
+        sf        = self.lidar_out_size_factor
+        # form h,w get the (x,y,z) in meters 
+        x = pc_range[0] + (topk_w.float() + 0.5) * vs[0] * sf
+        y = pc_range[1] + (topk_h.float() + 0.5) * vs[1] * sf
+        z = x.new_full(x.shape, (pc_range[2] + pc_range[5]) / 2.0)
+
+        # Normalize to [0,1] then inverse-sigmoid (matches how ref_pts are stored)
+        x_n = (x - pc_range[0]) / (pc_range[3] - pc_range[0])
+        y_n = (y - pc_range[1]) / (pc_range[4] - pc_range[1])
+        z_n = (z - pc_range[2]) / (pc_range[5] - pc_range[2])
+        xyz_norm = torch.stack([x_n, y_n, z_n], dim=-1).clamp(1e-6, 1 - 1e-6)
+        # offsets are predicted in the inversed_sigmoid space so its more spread -> easier, need to store in inverse_sigmoid
+        ref_pts = inverse_sigmoid(xyz_norm)            # [B, num_select, 3]
+
+        # Sample BEV features at peak locations
+        ns = topk_h.shape[1]
+        b_idx = torch.arange(B, device=bev_feat.device).unsqueeze(1).expand(B, ns).reshape(-1)
+        h_idx = topk_h.reshape(-1)
+        w_idx = topk_w.reshape(-1)
+        peak_feats = bev_feat[b_idx, :, h_idx, w_idx]      # [B*ns, C_bev]
+        peak_feats = peak_feats.view(B, ns, -1)             # [B, ns, C_bev]
+
+        # Project BEV features → embed_dims and add category embedding
+        peak_feats = self.lidar_bev_proj(peak_feats)        # [B, ns, embed_dims]
+        cat_embed  = self.category_embeds(topk_cls)         # [B, ns, embed_dims]
+        content    = peak_feats + cat_embed                 # [B, ns, embed_dims]
+
+        # query format used by pts_bbox_head: [num_query, embed_dims * 2]
+        # first half = content, second half = positional (same as content here)
+        queries = torch.cat([content, content], dim=-1)     # [B, ns, embed_dims*2]
+
+        # Return for batch 0 (BS=1 assumption same as rest of ViP3D)
+        return ref_pts[0], queries[0]                       # [ns, 3], [ns, embed_dims*2]
+
+    def _generate_gt_heatmap(self, gt_boxes, gt_labels, H, W, device):
+        """
+        Generate CenterPoint-style Gaussian heatmaps from GT 3D boxes.
+
+        Args:
+            gt_boxes  (Tensor): [N, 10+] normalized boxes (output of normalize_bbox)
+            gt_labels (Tensor): [N]      class indices
+            H, W      (int):             heatmap spatial size
+            device                       target device
+
+        Returns:
+            gt_heatmap (Tensor): [num_classes, H, W]  values in [0, 1]
+        """
+        gt_heatmap = np.zeros((self.num_classes, H, W), dtype=np.float32)
+        pc_range  = self.pc_range
+        vs        = self.lidar_voxel_size
+        sf        = self.lidar_out_size_factor
+
+        for box, label in zip(gt_boxes.cpu().numpy(), gt_labels.cpu().numpy()):
+            cls = int(label)
+            if cls < 0 or cls >= self.num_classes:
+                continue
+
+            # values in meters
+            # box[:2] are normalized x,y — denormalize to metric
+            x_m = box[0]
+            y_m = box[1]
+
+            # Metric → grid
+            col = (x_m - pc_range[0]) / (vs[0] * sf)
+            row = (y_m - pc_range[1]) / (vs[1] * sf)
+            col_i, row_i = int(col), int(row)
+
+            if not (0 <= col_i < W and 0 <= row_i < H):
+                continue
+
+            # Gaussian radius from box footprint (wl = box[2:4] are log-size encoded;
+            # use a fixed radius of 2 as a safe fallback for now)
+            radius = 2
+            diameter = 2 * radius + 1
+            sigma = diameter / 6.0
+            y_grid, x_grid = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+
+            # Produces a 5×5 bell shape — 1.0 at center, decays outward:
+            gaussian = np.exp(-(x_grid ** 2 + y_grid ** 2) / (2 * sigma ** 2))
+            gaussian[gaussian < np.finfo(gaussian.dtype).eps * gaussian.max()] = 0
+
+            r0, c0 = row_i, col_i
+            # figure out where it will be stored and handle the borders
+            top    = max(0, r0 - radius);  bottom = min(H, r0 + radius + 1)
+            left   = max(0, c0 - radius);  right  = min(W, c0 + radius + 1)
+            g_top  = top  - (r0 - radius); g_bottom = g_top + (bottom - top)
+            g_left = left - (c0 - radius); g_right  = g_left + (right - left)
+
+            np.maximum(
+                gt_heatmap[cls, top:bottom, left:right],
+                gaussian[g_top:g_bottom, g_left:g_right],
+                out=gt_heatmap[cls, top:bottom, left:right])
+
+        return torch.from_numpy(gt_heatmap).to(device)

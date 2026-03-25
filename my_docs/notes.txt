@@ -1,0 +1,86 @@
+select_topk_from_heatmap - even if slot selects pixels already tracked, slot will not be considered for tracking this object because it is not in the hungarian pool
+check loss if the average of the heatmap loss is correct
+
+gaussian radius supervising might not be sufficient
+
+Inference duplicate problem
+The fix — before top-K selection, zero out heatmap cells at the BEV grid locations of all active tracks. This costs almost nothing and guarantees the conflict never arises rather than relying on the model learning to suppress it.
+
+TOUCHED IN vip3d.py
+
+imports — add import torch.nn.functional as F
+
+__init__ signature — add use_lidar=False, lidar_bev_channels=256, lidar_voxel_size=None, lidar_out_size_factor=4
+
+__init__ body — replace the if True: block (L141-144): conditionally create either query_embedding + reference_points (original) or category_embeds + heatmap_head + lidar_bev_proj (LiViP3D)
+
+_generate_empty_tracks — remove shape/device dependency on query_embedding; for lidar case initialize query and ref_pts as zeros (filled later from heatmap)
+
+_copy_tracks_for_loss — fix device reference: self.query_embedding.weight.device → self.bbox_size_fc.weight.device (two lines)
+
+extract_feat — add LiDAR branch: call extract_pts_feat when use_lidar=True and return bev_feats as third return value instead of None
+
+new method select_topk_from_heatmap — NMS via max pool, suppress active track locations, top-K selection, grid→metric→inverse sigmoid, sample BEV features, add category embedding, return ref_pts and queries
+
+new method _generate_gt_heatmap — draw Gaussian peaks on BEV grid from GT box centers for heatmap supervision
+
+_forward_single — after extract_feat, before pts_bbox_head: compute heatmap, fill empty slots with suppression, compute heatmap focal loss and store in criterion.losses_dict
+
+_inference_single — same slot-filling block as _forward_single but without heatmap loss (inference only)
+
+
+--------------------------
+
+Change input_modality:
+
+
+input_modality = dict(
+    use_lidar=True,    # was False
+    use_camera=True,
+    ...
+)
+Add PointPillars backbone to model dict (after radar_encoder):
+
+
+pts_voxel_layer=dict(
+    max_num_points=20,
+    voxel_size=voxel_size,
+    max_voxels=(30000, 40000),
+    point_cloud_range=point_cloud_range),
+pts_voxel_encoder=dict(
+    type='PillarFeatureNet',
+    in_channels=5,
+    feat_channels=[64],
+    with_distance=False,
+    voxel_size=voxel_size,
+    point_cloud_range=point_cloud_range,
+    norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
+    legacy=False),
+pts_middle_encoder=dict(
+    type='PointPillarsScatter',
+    in_channels=64,
+    output_shape=[512, 512]),
+pts_backbone=dict(
+    type='SECOND',
+    in_channels=64,
+    out_channels=[64, 128, 256],
+    layer_nums=[3, 5, 5],
+    layer_strides=[2, 2, 2],
+    norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
+    conv_cfg=dict(type='Conv2d', bias=False)),
+pts_neck=dict(
+    type='SECONDFPN',
+    in_channels=[64, 128, 256],
+    out_channels=[128, 128, 128],
+    upsample_strides=[0.5, 1, 2],
+    norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
+    upsample_cfg=dict(type='deconv', bias=False),
+    use_conv_for_no_stride=True),
+Add LiViP3D keys to model dict:
+
+
+use_lidar=True,
+lidar_bev_channels=384,   # 128+128+128 from SECONDFPN
+lidar_voxel_size=voxel_size,
+lidar_out_size_factor=4,
+
