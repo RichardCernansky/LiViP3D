@@ -447,6 +447,7 @@ class ViP3D(MVXTwoStageDetector):
 
         #always run
         if True:
+            # extract features - run all sensor backbones for the frame
             img_feats, radar_feats, pts_feats = self.extract_feat(
                 points, img=img, radar=radar, img_metas=img_metas)
 
@@ -1225,7 +1226,7 @@ class ViP3D(MVXTwoStageDetector):
             query_feats(Tensor): [num_select, embed_dims * 2] content + pos
         """
         B, num_classes, H, W = heatmap.shape
-        scores = heatmap.sigmoid()  # [B, K, H, W]
+        scores = heatmap.detach().sigmoid() # [B, K, H, W]
 
         # Suppress heatmap cells at active track locations
         if active_ref_pts is not None and len(active_ref_pts) > 0:

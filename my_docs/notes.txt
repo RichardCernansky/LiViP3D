@@ -1,7 +1,9 @@
 select_topk_from_heatmap - even if slot selects pixels already tracked, slot will not be considered for tracking this object because it is not in the hungarian pool
 check loss if the average of the heatmap loss is correct
 
-gaussian radius supervising might not be sufficient
+gaussian const radius supervising might not be sufficient for different classes
+check if the x_m, y_m coor handling is correct
+visualize the heatmap predictions agains ground truth
 
 Inference duplicate problem
 The fix — before top-K selection, zero out heatmap cells at the BEV grid locations of all active tracks. This costs almost nothing and guarantees the conflict never arises rather than relying on the model learning to suppress it.

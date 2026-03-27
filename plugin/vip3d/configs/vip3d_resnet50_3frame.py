@@ -52,6 +52,45 @@ model = dict(
         in_channels=13,
         out_channels=[32],
         norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01), ),
+# ---- added LiVip3D
+    use_lidar=True,
+    lidar_bev_channels=384,
+    lidar_voxel_size=[0.2, 0.2, 8],
+    lidar_out_size_factor=4,
+    pts_voxel_layer=dict(
+        max_num_points=20,
+        voxel_size=[0.2, 0.2, 8],
+        max_voxels=(30000, 40000),
+        point_cloud_range=point_cloud_range),
+    pts_voxel_encoder=dict(
+        type='PillarFeatureNet',
+        in_channels=5,
+        feat_channels=[64],
+        with_distance=False,
+        voxel_size=[0.2, 0.2, 8],
+        norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
+        point_cloud_range=point_cloud_range),
+    pts_middle_encoder=dict(
+        type='PointPillarsScatter',
+        in_channels=64,
+        output_shape=[512, 512]),
+    pts_backbone=dict(
+        type='SECOND',
+        in_channels=64,
+        out_channels=[128, 256],
+        layer_nums=[3, 5],
+        layer_strides=[2, 2],
+        norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
+        conv_cfg=dict(type='Conv2d', bias=False)),
+    pts_neck=dict(
+        type='SECONDFPN',
+        in_channels=[128, 256],
+        out_channels=[128, 256],
+        upsample_strides=[1, 2],
+        norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
+        upsample_cfg=dict(type='deconv', bias=False),
+        use_conv_for_no_stride=False),
+# ----- added LiVip3D
     img_backbone=dict(
         type='ResNet',
         with_cp=False,
@@ -97,7 +136,7 @@ model = dict(
         type='DeformableDETR3DCamHeadTrackPlusRaw',
         num_classes=7,
         in_channels=256,
-        num_cams=6,
+        num_cams=3,
         num_feature_levels=4,
         with_box_refine=True,
         transformer=dict(
@@ -244,17 +283,20 @@ data = dict(
         # we use box_type_3d='LiDAR' in kitti and nuscenes dataset
         # and box_type_3d='Depth' in sunrgbd and scannet dataset.
         box_type_3d='LiDAR',
+        camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT'],
         do_pred=True),
     # ),
     val=dict(type=dataset_type, pipeline_single=test_pipeline, pipeline_post=test_pipeline_post, classes=class_names, modality=input_modality,
              ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
              num_frames_per_sample=1,
+             camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT'],
              do_pred=True),
     test=dict(type=dataset_type, pipeline_single=test_pipeline,
               pipeline_post=test_pipeline_post,
               classes=class_names, modality=input_modality,
               ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
               num_frames_per_sample=1,
+                camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT'],
               do_pred=True))
 
 optimizer = dict(
@@ -264,6 +306,8 @@ optimizer = dict(
     paramwise_cfg=dict(
         custom_keys={
             'img_backbone': dict(lr_mult=0.1),
+            'pts_backbone': dict(lr_mult=0.1),
+            'pts_neck':     dict(lr_mult=0.1),
         }),
     weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
@@ -281,6 +325,6 @@ evaluation = dict(interval=24)
 runner = dict(type='EpochBasedRunner', max_epochs=24)
 
 find_unused_parameters = True
-load_from = 'ckpts/detr3d_resnet50.pth'
+load_from = 'ckpts/livip3d_init.pth'
 
 fp16 = dict(loss_scale='dynamic')

@@ -134,6 +134,7 @@ class NuScenesTrackDatasetRadar(Dataset):
                  do_pred=False,
                  calc_prediction_metric=False,
                  generate_nuscenes_prediction_infos_val=False,
+                 camera_types=None, # new - LiVip3D
                  **kwargs,
                  ):
         self.load_interval = load_interval
@@ -144,6 +145,7 @@ class NuScenesTrackDatasetRadar(Dataset):
         self.ann_file = ann_file
         self.test_mode = test_mode
         self.modality = modality
+        self.camera_types = camera_types # new - LiVip3D
         self.filter_empty_gt = filter_empty_gt
         self.box_type_3d, self.box_mode_3d = get_box_type(box_type_3d)
 
@@ -669,6 +671,8 @@ class NuScenesTrackDatasetRadar(Dataset):
             intrinsics = []
             extrinsics = []
             for cam_type, cam_info in info['cams'].items():
+                if self.camera_types is not None and cam_type not in self.camera_types:
+                    continue
                 if self.data_root not in cam_info['data_path']:
                     image_paths.append(cam_info['data_path'].replace('data/nuscenes/', self.data_root))
                 else:
