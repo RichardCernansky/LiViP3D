@@ -190,7 +190,7 @@ class ViP3D(MVXTwoStageDetector):
         self.l2g_r_mat = None
         self.l2g_t = None
 
-        self.radar_encoder = build_radar_encoder(radar_encoder)
+        self.radar_encoder = build_radar_encoder(radar_encoder) if radar_encoder else None
 
         self.do_pred = do_pred
         self.relative_pred = relative_pred

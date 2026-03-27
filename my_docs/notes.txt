@@ -86,3 +86,6 @@ lidar_bev_channels=384,   # 128+128+128 from SECONDFPN
 lidar_voxel_size=voxel_size,
 lidar_out_size_factor=4,
 
+
+EXTRACT .PKL
+

@@ -325,7 +325,7 @@ evaluation = dict(interval=24)
 runner = dict(type='EpochBasedRunner', max_epochs=24)
 
 find_unused_parameters = True
-load_from = 'ckpts/livip3d_init.pth'
-# load_from = 'ckpts/detr3d_resnet50.pth'
+# load_from = 'ckpt_init/livip3d_init.pth'
+load_from = 'ckpt_init/detr3d_resnet50.pth'
 
 fp16 = dict(loss_scale='dynamic')
