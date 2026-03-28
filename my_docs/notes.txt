@@ -12,6 +12,8 @@ TOUCHED IN vip3d.py
 
 imports — add import torch.nn.functional as F
 
+---CONFIGSS---
+
 __init__ signature — add use_lidar=False, lidar_bev_channels=256, lidar_voxel_size=None, lidar_out_size_factor=4
 
 __init__ body — replace the if True: block (L141-144): conditionally create either query_embedding + reference_points (original) or category_embeds + heatmap_head + lidar_bev_proj (LiViP3D)
@@ -31,61 +33,10 @@ _forward_single — after extract_feat, before pts_bbox_head: compute heatmap, f
 _inference_single — same slot-filling block as _forward_single but without heatmap loss (inference only)
 
 
---------------------------
-
-Change input_modality:
-
-
-input_modality = dict(
-    use_lidar=True,    # was False
-    use_camera=True,
-    ...
-)
-Add PointPillars backbone to model dict (after radar_encoder):
-
-
-pts_voxel_layer=dict(
-    max_num_points=20,
-    voxel_size=voxel_size,
-    max_voxels=(30000, 40000),
-    point_cloud_range=point_cloud_range),
-pts_voxel_encoder=dict(
-    type='PillarFeatureNet',
-    in_channels=5,
-    feat_channels=[64],
-    with_distance=False,
-    voxel_size=voxel_size,
-    point_cloud_range=point_cloud_range,
-    norm_cfg=dict(type='BN1d', eps=1e-3, momentum=0.01),
-    legacy=False),
-pts_middle_encoder=dict(
-    type='PointPillarsScatter',
-    in_channels=64,
-    output_shape=[512, 512]),
-pts_backbone=dict(
-    type='SECOND',
-    in_channels=64,
-    out_channels=[64, 128, 256],
-    layer_nums=[3, 5, 5],
-    layer_strides=[2, 2, 2],
-    norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
-    conv_cfg=dict(type='Conv2d', bias=False)),
-pts_neck=dict(
-    type='SECONDFPN',
-    in_channels=[64, 128, 256],
-    out_channels=[128, 128, 128],
-    upsample_strides=[0.5, 1, 2],
-    norm_cfg=dict(type='BN', eps=1e-3, momentum=0.01),
-    upsample_cfg=dict(type='deconv', bias=False),
-    use_conv_for_no_stride=True),
-Add LiViP3D keys to model dict:
-
-
-use_lidar=True,
-lidar_bev_channels=384,   # 128+128+128 from SECONDFPN
-lidar_voxel_size=voxel_size,
-lidar_out_size_factor=4,
-
-
-EXTRACT .PKL
-
+COMMANDS
+# crete .PKL
+python tools/data_converter/nusc_tracking.py
+# run the training 
+ bash tools/dist_train.sh plugin/vip3d/configs/vip3d_resnet50_3cam.py 1 --work-dir=work_dirs/vip3d_resnet50_3cam
+# watch the log
+tail -f work_dirs/vip3d_resnet50_3cam/*.log | grep -o "loss: [0-9.]*\|grad_norm: [0-9.]*\|lr: [0-9e.-]*"

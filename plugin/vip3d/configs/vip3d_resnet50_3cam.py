@@ -113,6 +113,7 @@ model = dict(
                             pc_range=point_cloud_range,
                             num_points=1,
                             embed_dims=256,
+                            num_cams=3,
                         )
                     ],
                     feedforward_channels=512,

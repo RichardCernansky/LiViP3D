@@ -642,8 +642,11 @@ class NuScenesTrackDatasetRadar(Dataset):
             pts_filename=info['lidar_path'],
             sweeps=info['sweeps'],
             timestamp=info['timestamp'] / 1e6,
-            radar=info['radars'],
+            # radar=info['radars'], #LiVip3D
         )
+        #LiVip3D
+        if self.modality.get('use_radar', False):
+            input_dict['radar'] = info['radars']
 
         # print('index', index, info['timestamp'] / 1e6)
 

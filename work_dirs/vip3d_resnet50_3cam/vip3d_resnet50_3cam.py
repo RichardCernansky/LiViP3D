@@ -378,7 +378,8 @@ model = dict(
                             type='Detr3DCrossAtten',
                             pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
                             num_points=1,
-                            embed_dims=256)
+                            embed_dims=256,
+                            num_cams=3)
                     ],
                     feedforward_channels=512,
                     ffn_dropout=0.1,

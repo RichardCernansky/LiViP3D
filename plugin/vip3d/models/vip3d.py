@@ -247,7 +247,10 @@ class ViP3D(MVXTwoStageDetector):
         reference_points = reference_points + velo_pad * time_delta
 
         ref_pts = reference_points @ l2g_r1.T + l2g_t1
-        ref_pts = (ref_pts - l2g_t2) @ torch.linalg.inv(l2g_r2).T.type(torch.float)
+        # fix — rotation matrix: inv(R).T = R:
+        ref_pts = (ref_pts - l2g_t2) @ l2g_r2.type(torch.float)
+        # ref_pts = (ref_pts - l2g_t2) @ torch.linalg.inv(l2g_r2).T.type(torch.float)
+
 
         ref_pts[..., 0:1] = (ref_pts[..., 0:1] - pc_range[0]) / (pc_range[3] - pc_range[0])
         ref_pts[..., 1:2] = (ref_pts[..., 1:2] - pc_range[1]) / (pc_range[4] - pc_range[1])
@@ -628,9 +631,10 @@ class ViP3D(MVXTwoStageDetector):
             # for bs 1
             lidar2img = img_metas[0]['lidar2img']  # [T, num_cam]
             for i in range(num_frame):
-                points_single = [p_[i] for p_ in points]
+                points_single = [p_[i] for p_ in points] if points is not None else None
+
                 img_single = torch.stack([img_[i] for img_ in img], dim=0)
-                radar_single = torch.stack([radar_[i] for radar_ in radar], dim=0)
+                radar_single = torch.stack([radar_[i] for radar_ in radar], dim=0) if radar is not None else None 
 
                 img_metas_single = deepcopy(img_metas)
                 img_metas_single[0]['lidar2img'] = lidar2img[i]
