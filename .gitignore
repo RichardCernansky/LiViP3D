@@ -1,3 +1,6 @@
 ckpt_init
 mmdetection3d
-works_dirs
+work_dirs/
+data
+*.log
+*.pth

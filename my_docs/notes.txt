@@ -40,3 +40,4 @@ python tools/data_converter/nusc_tracking.py
  bash tools/dist_train.sh plugin/vip3d/configs/vip3d_resnet50_3cam.py 1 --work-dir=work_dirs/vip3d_resnet50_3cam
 # watch the log
 tail -f work_dirs/vip3d_resnet50_3cam/*.log | grep -o "loss: [0-9.]*\|grad_norm: [0-9.]*\|lr: [0-9e.-]*"
+
