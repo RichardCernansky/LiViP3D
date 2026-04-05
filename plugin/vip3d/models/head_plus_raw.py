@@ -260,3 +260,91 @@ class DeformableDETR3DCamHeadTrackPlusRaw(nn.Module):
 
         return outputs_classes, outputs_coords, \
             last_query_feats, last_ref_points
+
+@HEADS.register_module()
+class TransFusionDetHead(DeformableDETR3DCamHeadTrackPlusRaw):
+    """TransFusion 2-layer detection head (LiDAR BEV + SMCA camera).
+    Inherits layer init and weight init from parent; only forward changes.
+    """
+
+    def forward(self, mlvl_feats, radar_feats, query_embeds, ref_points,
+                ref_size, img_metas, bev_feat=None, petr_feature=False):
+        # ── positional encoding on multi-level image features (same as parent)
+        batch_size = mlvl_feats[0].size(0)
+        input_img_h, input_img_w = img_metas[0]['input_shape']
+        img_masks = mlvl_feats[0].new_ones(
+            (batch_size, input_img_h, input_img_w))
+        for img_id in range(batch_size):
+            img_h, img_w, _ = img_metas[img_id]['img_shape'][0][0]
+            img_masks[img_id, :img_h, :img_w] = 0
+
+        for i, feat in enumerate(mlvl_feats):
+            B, N, C, H, W = feat.size()
+            mlvl_masks = F.interpolate(
+                img_masks[None], size=feat.shape[-2:]).to(torch.bool).squeeze(0)
+            pos_enc = self.positional_encoding(mlvl_masks)
+            pos_enc = pos_enc.unsqueeze(1).repeat(1, N, 1, 1, 1)
+            lvl_enc = self.level_embeds[i].view(1, 1, -1, 1, 1)
+            cam_enc = self.cam_embeds.view(1, N, C, 1, 1)
+            pos_enc = pos_enc + lvl_enc + cam_enc
+            mlvl_feats[i] = feat + pos_enc
+
+        # ── 2-layer TransFusion decoder
+        hs, inter_references, inter_box_sizes = self.transformer(
+            mlvl_feats,
+            query_embeds,
+            ref_points,
+            ref_size,
+            reg_branches=self.reg_branches,
+            img_metas=img_metas,
+            radar_feats=radar_feats,
+            bev_feat=bev_feat,          # <-- only addition vs. parent
+        )
+
+        hs = hs.permute(0, 2, 1, 3)    # [num_dec, B, num_q, D]
+        outputs_classes = []
+        outputs_coords = []
+
+        from mmdet.models.utils.transformer import inverse_sigmoid as _inv_sig
+        for lvl in range(hs.shape[0]):
+            if lvl == 0:
+                reference = ref_points.sigmoid()
+                ref_size_base = ref_size
+            else:
+                reference = inter_references[lvl - 1]
+                ref_size_base = inter_box_sizes[lvl - 1]
+            reference = _inv_sig(reference)
+
+            outputs_class = self.cls_branches[lvl](hs[lvl])
+            xywlzh = self.reg_branches[lvl](hs[lvl])
+            direction_pred = self.direction_branches[lvl](hs[lvl])
+            velo_pred = self.velo_branches[lvl](hs[lvl])
+
+            assert reference.shape[-1] == 3
+            xywlzh[..., 0:2] += reference[..., 0:2]
+            xywlzh[..., 0:2] = xywlzh[..., 0:2].sigmoid()
+            xywlzh[..., 4:5] += reference[..., 2:3]
+            xywlzh[..., 4:5] = xywlzh[..., 4:5].sigmoid()
+            last_ref_points = torch.cat(
+                [xywlzh[..., 0:2], xywlzh[..., 4:5]], dim=-1)
+
+            xywlzh[..., 0:1] = (xywlzh[..., 0:1] *
+                (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0])
+            xywlzh[..., 1:2] = (xywlzh[..., 1:2] *
+                (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1])
+            xywlzh[..., 4:5] = (xywlzh[..., 4:5] *
+                (self.pc_range[5] - self.pc_range[2]) + self.pc_range[2])
+
+            xywlzh[..., 2:4] = xywlzh[..., 2:4] + ref_size_base[..., 0:2]
+            xywlzh[..., 5:6] = xywlzh[..., 5:6] + ref_size_base[..., 2:3]
+
+            bbox_pred = torch.cat([xywlzh, direction_pred, velo_pred], dim=2)
+            outputs_classes.append(outputs_class)
+            outputs_coords.append(bbox_pred)
+
+        outputs_classes = torch.stack(outputs_classes)
+        outputs_coords = torch.stack(outputs_coords)
+        last_ref_points = _inv_sig(last_ref_points)
+        last_query_feats = hs[-1]
+
+        return outputs_classes, outputs_coords, last_query_feats, last_ref_points

@@ -124,44 +124,41 @@ model = dict(
         norm_cfg=dict(type='BN2d'),
         relu_before_extra_convs=True),
     pts_bbox_head=dict(
-        type='DeformableDETR3DCamHeadTrackPlusRaw',
+        type='TransFusionDetHead',
         num_classes=7,
         in_channels=256,
         num_cams=3,
         num_feature_levels=4,
-        with_box_refine=True,
         transformer=dict(
-            type='Detr3DCamTrackTransformer',
+            type='TransFusionTransformer',
             decoder=dict(
-                type='Detr3DCamTrackPlusTransformerDecoder',
-                num_layers=6,
-                return_intermediate=True,
-                transformerlayers=dict(
-                    type='DetrTransformerDecoderLayer',
-                    attn_cfgs=[
-                        dict(
-                            type='MultiheadAttention',
-                            embed_dims=256,
-                            num_heads=8,
-                            dropout=0.1),
-                        dict(
-                            type='Detr3DCrossAtten',
-                            pc_range=point_cloud_range,
-                            num_points=1,
-                            embed_dims=256,
-                            num_cams=3,
-                        )
-                    ],
-                    feedforward_channels=512,
-                    ffn_dropout=0.1,
-                    operation_order=('self_attn', 'norm', 'cross_attn', 'norm',
-                                     'ffn', 'norm')))),
+                type='TransFusionTransformerDecoder',
+                embed_dims=256,
+                num_heads=8,
+                ffn_dims=512,
+                dropout=0.1,
+                lidar_bev_attn=dict(
+                    type='LiDARBEVCrossAtten',
+                    embed_dims=256,
+                    num_heads=8,
+                    bev_in_channels=384,
+                    dropout=0.1),
+                smca_attn=dict(
+                    type='SMCACrossAtten',
+                    embed_dims=256,
+                    num_heads=8,
+                    num_cams=3,
+                    num_levels=4,
+                    pc_range=point_cloud_range,
+                    dropout=0.1),
+            )),
         pc_range=point_cloud_range,
         positional_encoding=dict(
             type='SinePositionalEncoding',
             num_feats=128,
             normalize=True,
-            offset=-0.5), ),
+            offset=-0.5),
+    ),
     do_pred=True,
     relative_pred=True,
     agents_layer_0=True,
@@ -205,9 +202,18 @@ train_pipeline = [
         type='LoadPointsFromFile',
         coord_type='LIDAR',
         load_dim=5,
-        use_dim=5,
+        use_dim=[0, 1, 2, 3, 4],
         file_client_args=file_client_args),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        load_dim=5,
+        sweeps_num=10,
+        use_dim=[0, 1, 2, 3, 4],
+        file_client_args=file_client_args,
+        pad_empty_sweeps=True,
+        remove_close=True),
     dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(type='InstanceRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
@@ -216,8 +222,8 @@ train_pipeline = [
 train_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
-        'points', 'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds', 'img',
-        'timestamp', 'l2g_r_mat', 'l2g_t',
+        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds', 'img',
+        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
         'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
 
@@ -229,6 +235,7 @@ test_pipeline = [
         use_dim=5,
         file_client_args=file_client_args),
     dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
 ]

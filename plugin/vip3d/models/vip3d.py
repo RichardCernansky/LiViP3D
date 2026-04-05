@@ -470,7 +470,10 @@ class ViP3D(MVXTwoStageDetector):
                 active_ref = track_instances.ref_pts[track_instances.obj_idxes >= 0] \
                             if (track_instances.obj_idxes >= 0).any() else None
                 new_ref_pts, new_queries = self.select_topk_from_heatmap(
-                    heatmap, bev_feat, num_select=num_empty, active_ref_pts=active_ref)
+                    heatmap, bev_feat, num_select=num_empty, active_ref_pts=active_ref, img_metas=img_metas)
+
+                track_instances.ref_pts = track_instances.ref_pts.clone()
+                track_instances.query   = track_instances.query.clone()
                 track_instances.ref_pts[empty_mask] = new_ref_pts
                 track_instances.query[empty_mask]   = new_queries
 
@@ -500,7 +503,8 @@ class ViP3D(MVXTwoStageDetector):
         output_classes, output_coords, \
             query_feats, last_ref_pts = self.pts_bbox_head(
             img_feats, radar_feats, track_instances.query,
-            track_instances.ref_pts, ref_box_sizes, img_metas)
+            track_instances.ref_pts, ref_box_sizes, img_metas,
+            bev_feat=bev_feat if (self.use_lidar and pts_feats is not None) else None)
 
 
         if self.add_branch:
@@ -832,9 +836,13 @@ class ViP3D(MVXTwoStageDetector):
                     active_ref = track_instances.ref_pts[track_instances.obj_idxes >= 0] \
                                 if (track_instances.obj_idxes >= 0).any() else None
                     new_ref_pts, new_queries = self.select_topk_from_heatmap(
-                        heatmap, bev_feat, num_select=num_empty, active_ref_pts=active_ref)
+                        heatmap, bev_feat, num_select=num_empty, active_ref_pts=active_ref, img_metas=img_metas)
+
+                    track_instances.ref_pts = track_instances.ref_pts.clone()
+                    track_instances.query   = track_instances.query.clone()
                     track_instances.ref_pts[empty_mask] = new_ref_pts
                     track_instances.query[empty_mask]   = new_queries
+
             # ── end LiViP3D ──────────────────────────────────────────────────────────
 
 
@@ -1215,8 +1223,34 @@ class ViP3D(MVXTwoStageDetector):
         assert query.shape == (len(output_embedding), 1, 256)
         query = query.squeeze(1)
         return query
+    
+    def _build_camera_visibility_mask(self, H, W, img_metas, device):
+        lidar2img = torch.tensor(
+            np.array(img_metas[0]['lidar2img']), dtype=torch.float32, device=device)
+        # [num_cams, 4, 4]
 
-    def select_topk_from_heatmap(self, heatmap, bev_feat, num_select, active_ref_pts=None):
+        xs = torch.linspace(self.pc_range[0], self.pc_range[3], W, device=device)
+        ys = torch.linspace(self.pc_range[1], self.pc_range[4], H, device=device)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')  # [H, W]
+        pts = torch.stack([grid_x, grid_y,
+                        torch.zeros_like(grid_x),
+                        torch.ones_like(grid_x)], dim=-1)  # [H, W, 4]
+        pts_flat = pts.view(-1, 4, 1)  # [H*W, 4, 1]
+
+        l2i = lidar2img.unsqueeze(0)  # [1, num_cams, 4, 4]
+        pts_cam = torch.matmul(l2i, pts_flat.unsqueeze(1)).squeeze(-1)  # [H*W, num_cams, 4]
+
+        depth = pts_cam[..., 2]
+        u = pts_cam[..., 0] / depth.clamp(min=1e-5)
+        v = pts_cam[..., 1] / depth.clamp(min=1e-5)
+
+        img_h = img_metas[0]['img_shape'][0][0][0]
+        img_w = img_metas[0]['img_shape'][0][0][1]
+
+        visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
+        return visible.any(dim=-1).view(H, W)  # [H, W]
+
+    def select_topk_from_heatmap(self, heatmap, bev_feat, num_select, active_ref_pts=None, img_metas=None):
         """
         Select top-K object candidates from a BEV heatmap.
 
@@ -1249,6 +1283,9 @@ class ViP3D(MVXTwoStageDetector):
                     max(0, r - sup_r):min(H, r + sup_r + 1),
                     max(0, c - sup_r):min(W, c + sup_r + 1)] = 0.0
 
+        if img_metas is not None:
+            vis_mask = self._build_camera_visibility_mask(H, W, img_metas, heatmap.device)
+            scores = scores * vis_mask.unsqueeze(0).unsqueeze(0).float()
 
         # Local-max suppression via 3×3 max-pool (keeps only local peaks).
         # NuScenes 7 classes: 0=car,1=truck,2=bus,3=trailer,4=moto,5=bicycle,6=pedestrian

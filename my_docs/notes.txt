@@ -37,7 +37,145 @@ COMMANDS
 # crete .PKL
 python tools/data_converter/nusc_tracking.py
 # run the training 
- bash tools/dist_train.sh plugin/vip3d/configs/vip3d_resnet50_3cam.py 1 --work-dir=work_dirs/vip3d_resnet50_3cam
+bash tools/dist_train.sh plugin/vip3d/configs/vip3d_resnet50_3cam.py 1 --work-dir=work_dirs/vip3d_resnet50_3cam
+PYTHONPATH=. bash tools/dist_train.sh plugin/vip3d/configs/livip3d_resnet50_3cam.py 1 --work-dir=work_dirs/livip3d_resnet50_3cam
+
 # watch the log
 tail -f work_dirs/vip3d_resnet50_3cam/*.log | grep -o "loss: [0-9.]*\|grad_norm: [0-9.]*\|lr: [0-9e.-]*"
+
+QUESTIONS 
+SMCA over full image feature maps - enough memory?
+use single FPN ? 
+
+TODO:
+visualize predictions on baseline - evaluate
+put the resolution down, train baseline on resolution from chat config
+get single representation from FPN
+
+PSEUDO
+INPUT: LiDAR points [N, 5], 3 camera images [3, 448, 800]
+
+1. FEATURE EXTRACTION
+   LiDAR → Voxelize → SECOND backbone → SECONDFPN → bev_feat [1, 384, 128, 128]
+   Images → ResNet50 → FPN → img_feats [4 levels, each: 1, 3, 256, H, W]
+
+2. HEATMAP GENERATION
+   bev_feat → heatmap_head (conv layers) → heatmap [1, 7, 128, 128]
+   7 channels = 7 object classes, each cell = "probability of object center here"
+
+3. QUERY INITIALIZATION (fill empty tracking slots)
+   heatmap → local max suppression (3×3 pool) → pick top-N peaks
+   for each peak:
+       bev_feat at peak location → lidar_bev_proj → 256-dim content vector
+       peak class → category_embed → add to content vector
+       peak (x,y) → reference_point [3]
+   → 300 queries [300, 512], 300 reference_points [300, 3]
+
+4. ADD POSITIONAL ENCODINGS TO IMAGE FEATURES
+   for each FPN level:
+       img_feat += 2D_sine_pos_enc + level_embed + camera_embed
+
+5. LAYER 0 — LiDAR BEV decoder
+   self-attn:     300 queries talk to each other         [300, 256]
+   cross-attn:    queries attend to bev_feat [16384 cells] → weighted sum per query
+   FFN:           process each query independently
+   reg_branch[0]: predict Δ(x,y,z,w,l,h) → update reference_points
+
+6. LAYER 1 — SMCA camera decoder
+   self-attn:     300 queries talk to each other again
+   SMCA:          for each query:
+                    project ref_point → pixel (cx,cy) on each camera
+                    build Gaussian on 56×100 feature map centered at (cx,cy)
+                    attend to camera pixels, biased by Gaussian
+                    average over valid cameras
+   FFN:           process each query independently
+   reg_branch[1]: predict Δ(x,y,z,w,l,h) → update reference_points
+
+7. DECODE BOXES  (done twice: once per layer for loss)
+   for layer 0 and layer 1:
+       cls_branch   → class scores         [300, 7]
+       reg_branch   → box center + size    [300, 6]  + reference_point offset
+       direction    → sin(yaw), cos(yaw)   [300, 2]
+       velo_branch  → vx, vy               [300, 2]
+       → final box  [300, 10]
+
+8. LOSS (training only)
+   Hungarian matching: predictions ↔ ground truth boxes
+   loss = focal_loss(classes) + L1_loss(boxes) + heatmap_loss
+   computed on BOTH layer 0 and layer 1 outputs
+
+9. TRACKING UPDATE
+   layer 1 query features [300, 256] → memory bank → QIM
+   last_ref_points + predicted velocity → propagate to next frame
+
+OUTPUT: boxes [300, 10], class scores [300, 7], updated track states
+
+FILE CONTROL FLOW
+tools/train.py                  main()
+  config                          livip3d_resnet50_3cam.py       → parsed + merged
+  plugin/                         __init__.py                    → registers all custom classes
+  mmdet3d                         build_model()                  → ViP3D instantiated
+  mmdet3d                         build_dataset()                → NuScenesTrackDatasetRadar instantiated
+  mmdet3d                         train_model()                  → EpochBasedRunner.run()
+
+  ── per epoch ──────────────────────────────────────────────────────────────────
+  mmdet3d                         EpochBasedRunner.train()
+    mmdet3d                       DataLoader.__iter__()
+      dataset.py                  NuScenesTrackDatasetRadar.__getitem__()
+        pipeline.py / mmdet3d     [data pipeline: Load → Resize → Normalize → Pad → Format → Collect]
+
+    vip3d.py                      ViP3D.forward_train()
+      vip3d.py                      ViP3D.forward_single()        → called per frame in clip
+        vip3d.py                      ViP3D.extract_feat()
+          mmdet3d                       ResNet50.forward()         → image features
+          mmdet3d                       FPN.forward()              → 4-level img_feats
+          mmdet3d                       PillarFeatureNet.forward() → voxelized lidar
+          mmdet3d                       PointPillarsScatter.forward()
+          mmdet3d                       SECOND.forward()
+          mmdet3d                       SECONDFPN.forward()        → bev_feat [B,384,128,128]
+        vip3d.py                      ViP3D.heatmap_head()        → [B,7,H,W]
+        vip3d.py                      ViP3D.select_topk_from_heatmap() → fills empty query slots
+        head_plus_raw.py              TransFusionDetHead.forward()
+          transformer.py              TransFusionTransformer.forward()
+            transformer.py            TransFusionTransformerDecoder.forward()
+              attention_dert3d.py       LiDARBEVCrossAtten.forward()  → layer 0
+              attention_dert3d.py       SMCACrossAtten.forward()       → layer 1
+        loss.py                       ClipMatcher.forward()       → Hungarian match + losses
+
+    mmcv                          optimizer.step()               → AdamW update
+    mmcv                          lr_scheduler.step()            → CosineAnnealing
+
+  ── per interval ───────────────────────────────────────────────────────────────
+  mmdet3d                         EpochBasedRunner.val()         → every 24 epochs
+
+
+
+
+  Gaussian Mask (most important difference)
+Original TransFusion:
+
+
+radius = ceil(corners.norm(p=2) / 2)  # from projected box corners in image
+sigma = (radius * 2 + 1) / 6.0        # heuristic
+# isotropic — single sigma for x and y
+Your implementation:
+
+
+sigma_w = (wl[..., 0] / 20).clamp(0.02, 0.3)  # from ref_size directly
+sigma_h = (wl[..., 1] / 20).clamp(0.02, 0.3)
+# anisotropic — separate sigma for width and height
+Original computes sigma from the actual projected box corners in image space — more accurate. Yours uses the 3D box size / 20 as a heuristic — simpler but not image-scale aware. The /20 divisor is arbitrary.
+
+BEV Positional Encoding
+Original	Yours
+Type	Learned Conv1d embeddings	Fixed 2D sine
+Trainable	Yes	No
+Query Initialization
+Original uses heatmap-based dynamic init with category embedding added directly to query features. Yours splits a fixed query_embed into query + query_pos — the heatmap init happens separately in vip3d.py before the head is called.
+
+Reference Point Updates
+Original always detaches ref points between layers. Yours detaches position always, but lets gradient flow through ref_size after layer 0 (detach_size=False). This is a deliberate difference — allows box size to be refined with gradient.
+
+Multi-level FPN
+Original uses single-level BEV features. Yours explicitly fuses 4 FPN levels — this is the supervisor's requirement, not in the original paper.
 

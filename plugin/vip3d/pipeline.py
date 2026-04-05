@@ -196,6 +196,84 @@ class ScaleMultiViewImage3D(object):
         repr_str += f'(size={self.size}, '
         return repr_str
 
+@PIPELINES.register_module()
+class ResizeMultiViewKeepRatio(object):
+    """
+    Resize all camera images by a single scale factor (keep aspect ratio),
+    and update intrinsics/cam2img/lidar2img accordingly.
+
+    Args:
+        scale (float | tuple | list):
+            - float -> uniform scale factor (e.g., 0.75)
+            - tuple (w, h) -> target long/short size like MMCV img_scale
+        keep_ratio (bool): keep aspect ratio (True by default)
+        random_range (tuple[float,float] | None): if set, sample scale ~ U(a,b)
+    """
+    def __init__(self, scale=0.75, keep_ratio=True, random_range=None):
+        self.scale = scale
+        self.keep_ratio = keep_ratio
+        self.random_range = random_range
+
+    def _pick_scale(self, h, w):
+        if self.random_range is not None:
+            s = np.random.uniform(self.random_range[0], self.random_range[1])
+            return s
+        if isinstance(self.scale, (int, float)):
+            return float(self.scale)
+        tgt_w, tgt_h = self.scale
+        if self.keep_ratio:
+            return min(tgt_w / float(w), tgt_h / float(h))
+        else:
+            return (tgt_w / float(w), tgt_h / float(h))
+
+    def __call__(self, results):
+        assert 'img' in results, "Expect multiview images in results['img']"
+        imgs = results['img']
+        h, w = imgs[0].shape[:2]
+
+        s = self._pick_scale(h, w)
+
+        if isinstance(s, tuple):
+            sx, sy = s[0], s[1]
+            new_w, new_h = int(round(w * sx)), int(round(h * sy))
+        else:
+            sx = sy = float(s)
+            new_w, new_h = int(round(w * s)), int(round(h * s))
+
+        resized = [mmcv.imresize(im, (new_w, new_h), return_scale=False) for im in imgs]
+        results['img'] = resized
+
+        S = np.eye(4, dtype=np.float32)
+        S[0, 0] = sx
+        S[1, 1] = sy
+
+        if 'lidar2img' in results:
+            results['lidar2img'] = [S @ M for M in results['lidar2img']]
+
+        for k in ['cam2img', 'camera_intrinsics', 'intrinsic']:
+            if k in results:
+                new_list = []
+                for K in results[k]:
+                    K = np.array(K, dtype=np.float32)
+                    if K.shape == (3, 3):
+                        K = K.copy()
+                        K[0, 0] *= sx; K[1, 1] *= sy
+                        K[0, 2] *= sx; K[1, 2] *= sy
+                    elif K.shape == (4, 4):
+                        K = S @ K
+                    new_list.append(K)
+                results[k] = new_list
+
+        results['ori_shape'] = results.get('ori_shape', (h, w, 3))
+        results['img_shape'] = [(new_h, new_w, 3) for _ in resized]
+        results['scale_factor'] = (sx, sy, sx, sy)
+
+        return results
+
+    def __repr__(self):
+        return (f"{self.__class__.__name__}(scale={self.scale}, "
+                f"keep_ratio={self.keep_ratio}, random_range={self.random_range})")
+
 
 @PIPELINES.register_module()
 class LoadRadarPointsMultiSweeps(object):

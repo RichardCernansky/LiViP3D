@@ -335,3 +335,146 @@ class Detr3DCamTrackPlusTransformerDecoder(TransformerLayerSequence):
                 torch.stack(intermediate_box_sizes)
 
         return output, reference_points, ref_size
+
+@TRANSFORMER.register_module()
+class TransFusionTransformer(BaseModule):
+    """2-layer TransFusion transformer: Layer0=LiDAR BEV, Layer1=SMCA camera."""
+
+    def __init__(self, num_feature_levels=4, num_cams=3, decoder=None, **kwargs):
+        super(TransFusionTransformer, self).__init__(**kwargs)
+        self.decoder = build_transformer_layer_sequence(decoder)
+        self.embed_dims = self.decoder.embed_dims
+        self.num_feature_levels = num_feature_levels
+        self.num_cams = num_cams
+
+    def init_weights(self):
+        for p in self.parameters():
+            if p.dim() > 1:
+                nn.init.xavier_uniform_(p)
+
+    def forward(self, mlvl_feats, query_embed, reference_points, ref_size,
+                reg_branches=None, bev_feat=None, **kwargs):
+        assert query_embed is not None
+        bs = mlvl_feats[0].size(0)
+        query_pos, query = torch.split(query_embed, self.embed_dims, dim=1)
+        query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
+        query = query.unsqueeze(0).expand(bs, -1, -1)
+        reference_points = reference_points.unsqueeze(0).expand(bs, -1, -1)
+        ref_size = ref_size.unsqueeze(0).expand(bs, -1, -1)
+
+        reference_points = reference_points.sigmoid()
+
+        query = query.permute(1, 0, 2)
+        query_pos = query_pos.permute(1, 0, 2)
+
+        inter_states, inter_references, inter_box_sizes = self.decoder(
+            query=query,
+            key=None,
+            value=mlvl_feats,
+            query_pos=query_pos,
+            reference_points=reference_points,
+            reg_branches=reg_branches,
+            ref_size=ref_size,
+            bev_feat=bev_feat,
+            **kwargs)
+
+        return inter_states, inter_references, inter_box_sizes
+
+
+@TRANSFORMER_LAYER_SEQUENCE.register_module()
+class TransFusionTransformerDecoder(BaseModule):
+    """Custom 2-layer decoder: LiDAR BEV cross-attn + SMCA camera cross-attn."""
+
+    def __init__(self, embed_dims=256, num_heads=8, ffn_dims=512, dropout=0.1,
+                 lidar_bev_attn=None, smca_attn=None, **kwargs):
+        super(TransFusionTransformerDecoder, self).__init__()
+        from mmcv.cnn.bricks.registry import ATTENTION as ATT_REG
+        self.embed_dims = embed_dims
+        self.num_layers = 2
+
+        # ── Layer 0: self-attn + LiDAR BEV cross-attn + FFN
+        self.sa0 = nn.MultiheadAttention(embed_dims, num_heads, dropout=dropout)
+        self.ca0 = ATT_REG.build(lidar_bev_attn)
+        self.ff0 = nn.Sequential(
+            nn.Linear(embed_dims, ffn_dims), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(ffn_dims, embed_dims), nn.Dropout(dropout))
+        self.n0 = nn.ModuleList([nn.LayerNorm(embed_dims) for _ in range(3)])
+
+        # ── Layer 1: self-attn + SMCA camera cross-attn + FFN
+        self.sa1 = nn.MultiheadAttention(embed_dims, num_heads, dropout=dropout)
+        self.ca1 = ATT_REG.build(smca_attn)
+        self.ff1 = nn.Sequential(
+            nn.Linear(embed_dims, ffn_dims), nn.ReLU(), nn.Dropout(dropout),
+            nn.Linear(ffn_dims, embed_dims), nn.Dropout(dropout))
+        self.n1 = nn.ModuleList([nn.LayerNorm(embed_dims) for _ in range(3)])
+
+    def _update_ref(self, reg_branch, output, reference_points, ref_size, detach_size):
+        """Run regression head and update reference points and box sizes."""
+        tmp = reg_branch(output.permute(1, 0, 2))  # [B, num_q, code_size]
+        ref_pts_update = torch.cat([tmp[..., :2], tmp[..., 4:5]], dim=-1)
+        ref_size_update = torch.cat([tmp[..., 2:4], tmp[..., 5:6]], dim=-1)
+
+        new_ref = (ref_pts_update + inverse_sigmoid(reference_points)).sigmoid()
+        reference_points = new_ref.detach()
+
+        ref_size = ref_size + ref_size_update
+        if detach_size:
+            ref_size = ref_size.detach()
+
+        return reference_points, ref_size
+
+    def forward(self, query, key=None, value=None, query_pos=None,
+                reference_points=None, reg_branches=None, ref_size=None,
+                bev_feat=None, **kwargs):
+        """
+        Args:
+            query:            [num_q, B, D]
+            value:            list of [B, N, C, H, W]  (camera FPN levels)
+            reference_points: [B, num_q, 3]  normalised sigmoid
+            ref_size:         [B, num_q, 3]  wlh log space
+            bev_feat:         [B, C_bev, H_bev, W_bev]
+        """
+        intermediate = []
+        inter_ref = []
+        inter_size = []
+
+        # ── Layer 0: LiDAR BEV cross-attention ──────────────────────────────
+        q = query
+        # self-attention
+        q2, _ = self.sa0(q + query_pos, q + query_pos, q)
+        q = self.n0[0](q + q2)
+        # LiDAR BEV cross-attention
+        q2 = self.ca0(q, query_pos=query_pos, bev_feat=bev_feat, **kwargs)
+        q = self.n0[1](q + q2)
+        # FFN
+        q = self.n0[2](q + self.ff0(q.permute(1, 0, 2)).permute(1, 0, 2))
+
+        if reg_branches is not None:
+            reference_points, ref_size = self._update_ref(
+                reg_branches[0], q, reference_points, ref_size, detach_size=False)
+
+        intermediate.append(q)
+        inter_ref.append(reference_points)
+        inter_size.append(ref_size)
+
+        # ── Layer 1: SMCA camera cross-attention ─────────────────────────────
+        q2, _ = self.sa1(q + query_pos, q + query_pos, q)
+        q = self.n1[0](q + q2)
+        # SMCA
+        q2 = self.ca1(q, value=value, query_pos=query_pos,
+                      reference_points=reference_points,
+                      ref_size=ref_size, **kwargs)
+        q = self.n1[1](q + q2)
+        q = self.n1[2](q + self.ff1(q.permute(1, 0, 2)).permute(1, 0, 2))
+
+        if reg_branches is not None:
+            reference_points, ref_size = self._update_ref(
+                reg_branches[1], q, reference_points, ref_size, detach_size=True)
+
+        intermediate.append(q)
+        inter_ref.append(reference_points)
+        inter_size.append(ref_size)
+
+        return (torch.stack(intermediate),
+                torch.stack(inter_ref),
+                torch.stack(inter_size))

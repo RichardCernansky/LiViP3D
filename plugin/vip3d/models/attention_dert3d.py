@@ -642,3 +642,260 @@ class Detr3DCrossAttenPetrFeature(BaseModule):
         pos_feat = self.position_encoder(inverse_sigmoid(reference_points_3d)).permute(1, 0, 2)
 
         return self.dropout(output) + inp_residual + pos_feat
+
+# LiVip3D add
+@ATTENTION.register_module()
+class LiDARBEVCrossAtten(BaseModule):
+    """Cross-attention between object queries and LiDAR BEV feature map."""
+
+    def __init__(self, embed_dims=256, num_heads=8, bev_in_channels=384,
+                 dropout=0.1, init_cfg=None):
+        super(LiDARBEVCrossAtten, self).__init__(init_cfg)
+        self.embed_dims = embed_dims
+        self.dropout = nn.Dropout(dropout)
+        self.bev_proj = nn.Linear(bev_in_channels, embed_dims) \
+            if bev_in_channels != embed_dims else nn.Identity()
+        self.attn = nn.MultiheadAttention(embed_dims, num_heads, dropout=dropout)
+        self.output_proj = nn.Linear(embed_dims, embed_dims)
+
+    def _make_bev_pos_embed(self, H, W, device, dtype):
+        """2D sine positional encoding → [H*W, 1, embed_dims]."""
+        y = torch.arange(H, device=device, dtype=dtype) / H
+        x = torch.arange(W, device=device, dtype=dtype) / W
+        # [H, W]
+        grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
+        dim = self.embed_dims // 4
+        inv_freq = 1.0 / (10000 ** (torch.arange(dim, device=device, dtype=dtype) / dim))
+        # [H*W, dim]
+        pe_x = torch.outer(grid_x.flatten(), inv_freq)
+        pe_y = torch.outer(grid_y.flatten(), inv_freq)
+        # [H*W, embed_dims]
+        pe = torch.cat([pe_x.sin(), pe_x.cos(), pe_y.sin(), pe_y.cos()], dim=-1)
+        return pe.unsqueeze(1)  # [H*W, 1, embed_dims]
+
+    def forward(self, query, key=None, value=None, residual=None,
+                query_pos=None, bev_feat=None, **kwargs):
+        """
+        Args:
+            query:    [num_q, B, embed_dims]
+            bev_feat: [B, bev_in_channels, H, W]
+        Returns:
+            [num_q, B, embed_dims]
+        """
+        inp_residual = query
+        if query_pos is not None:
+            query = query + query_pos
+
+        B, C, H, W = bev_feat.shape
+        # [B, embed_dims, H, W] → [H*W, B, embed_dims]
+        bev = self.bev_proj(bev_feat.flatten(2).permute(2, 0, 1))
+        pos = self._make_bev_pos_embed(H, W, bev_feat.device, bev_feat.dtype)
+        bev = bev + pos
+
+        out, _ = self.attn(query=query, key=bev, value=bev)
+        out = self.output_proj(out)
+        return self.dropout(out) + inp_residual
+
+
+@ATTENTION.register_module()
+class SMCACrossAtten(BaseModule):
+    """Spatially Modulated Cross-Attention (SMCA) over multi-level camera FPN features."""
+
+    def __init__(self, embed_dims=256, num_heads=8, num_cams=3, num_levels=4,
+                 pc_range=None, dropout=0.1, init_cfg=None):
+        super(SMCACrossAtten, self).__init__(init_cfg)
+        self.embed_dims = embed_dims
+        self.num_heads = num_heads
+        self.num_cams = num_cams
+        self.num_levels = num_levels
+        self.pc_range = pc_range
+        self.scale = (embed_dims // num_heads) ** -0.5
+        self.dropout = nn.Dropout(dropout)
+
+        # fuse all 4 FPN levels into one [B, N, 256, H0, W0] representation
+        self.fusion_proj = nn.Linear(num_levels * embed_dims, embed_dims)
+
+        self.q_proj = nn.Linear(embed_dims, embed_dims)
+        self.k_proj = nn.Linear(embed_dims, embed_dims)
+        self.v_proj = nn.Linear(embed_dims, embed_dims)
+        self.output_proj = nn.Linear(embed_dims, embed_dims)
+
+        self.position_encoder = nn.Sequential(
+            nn.Linear(3, embed_dims),
+            nn.LayerNorm(embed_dims),
+            nn.ReLU(inplace=True),
+            nn.Linear(embed_dims, embed_dims),
+            nn.LayerNorm(embed_dims),
+            nn.ReLU(inplace=True),
+        )
+
+    def _fuse_fpn_levels(self, mlvl_feats):
+        """Upsample levels 1-3 to level-0 size, concat, project.
+        Args:
+            mlvl_feats: list of [B, N, C, H_l, W_l]
+        Returns:
+            [B, N, embed_dims, H0, W0]
+        """
+        B, N, C, H0, W0 = mlvl_feats[0].shape
+        upsampled = [mlvl_feats[0]]
+        for feat in mlvl_feats[1:]:
+            # [B*N, C, H_l, W_l] → upsample → [B, N, C, H0, W0]
+            f = feat.view(B * N, C, feat.shape[-2], feat.shape[-1])
+            f = F.interpolate(f, size=(H0, W0), mode='bilinear', align_corners=False)
+            upsampled.append(f.view(B, N, C, H0, W0))
+        # concat along channel dim → [B, N, num_levels*C, H0, W0]
+        fused = torch.cat(upsampled, dim=2)
+        # [B, N, H0, W0, num_levels*C] → linear → [B, N, H0, W0, embed_dims]
+        fused = fused.permute(0, 1, 3, 4, 2)
+        fused = self.fusion_proj(fused)
+        # → [B, N, embed_dims, H0, W0]
+        return fused.permute(0, 1, 4, 2, 3)
+
+    def _project_to_cameras(self, reference_points, img_metas):
+        """Project 3D reference points into each camera image plane.
+        Returns:
+            cx, cy: [B, num_q, num_cams]  normalised [0,1]
+            depth:  [B, num_q, num_cams]
+            valid:  [B, num_q, num_cams]  bool
+            ref_3d: [B, num_q, 3]         3D coords in metric space
+        """
+        lidar2img = []
+        for meta in img_metas:
+            lidar2img.append(meta['lidar2img'])
+        lidar2img = reference_points.new_tensor(np.asarray(lidar2img))  # [B, N, 4, 4]
+
+        ref = reference_points.clone()
+        ref[..., 0] = ref[..., 0] * (self.pc_range[3] - self.pc_range[0]) + self.pc_range[0]
+        ref[..., 1] = ref[..., 1] * (self.pc_range[4] - self.pc_range[1]) + self.pc_range[1]
+        ref[..., 2] = ref[..., 2] * (self.pc_range[5] - self.pc_range[2]) + self.pc_range[2]
+        ref_3d = ref.clone()
+
+        B, num_q = ref.shape[:2]
+        num_cam = lidar2img.shape[1]
+        ref_h = torch.cat([ref, torch.ones_like(ref[..., :1])], dim=-1)  # [B, num_q, 4]
+        ref_h = ref_h.view(B, 1, num_q, 4, 1).expand(-1, num_cam, -1, -1, -1)
+        l2i = lidar2img.view(B, num_cam, 1, 4, 4).expand(-1, -1, num_q, -1, -1)
+        pts_cam = torch.matmul(l2i, ref_h).squeeze(-1)  # [B, num_cam, num_q, 4]
+
+        depth = pts_cam[..., 2]  # [B, num_cam, num_q]
+        eps = 1e-5
+        pts2d = pts_cam[..., :2] / torch.clamp(depth.unsqueeze(-1), min=eps)
+
+        img_h = img_metas[0]['img_shape'][0][0][0]
+        img_w = img_metas[0]['img_shape'][0][0][1]
+        cx = pts2d[..., 0] / img_w  # [B, num_cam, num_q]
+        cy = pts2d[..., 1] / img_h
+
+        valid = (depth > eps) & (cx > 0) & (cx < 1) & (cy > 0) & (cy < 1)
+
+        # transpose to [B, num_q, num_cam]
+        return cx.permute(0, 2, 1), cy.permute(0, 2, 1), \
+               depth.permute(0, 2, 1), valid.permute(0, 2, 1), ref_3d
+
+    def _gaussian_mask(self, cx, cy, ref_size, H, W, device, dtype):
+        """Build per-query Gaussian spatial mask on the feature map.
+        Args:
+            cx, cy:   [B, num_q, num_cams]  normalised centre
+            ref_size: [B, num_q, 3]         wlh in log space
+        Returns:
+            [B, num_q, num_cams, H*W]
+        """
+        B, num_q, num_cams = cx.shape
+        wl = ref_size[..., :2].exp()  # [B, num_q, 2]  metric w, l
+        # rough sigma: box footprint projected to feature-map pixels
+        sigma_w = (wl[..., 0] / 20).clamp(0.02, 0.3)  # [B, num_q]
+        sigma_h = (wl[..., 1] / 20).clamp(0.02, 0.3)
+
+        # pixel grid [H, W]
+        gy = torch.linspace(0, 1, H, device=device, dtype=dtype)
+        gx = torch.linspace(0, 1, W, device=device, dtype=dtype)
+        grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')
+        grid_x = grid_x.flatten().view(1, 1, 1, -1)  # [1,1,1,H*W]
+        grid_y = grid_y.flatten().view(1, 1, 1, -1)
+
+        cx = cx.unsqueeze(-1)  # [B, num_q, num_cams, 1]
+        cy = cy.unsqueeze(-1)
+        sigma_w = sigma_w.unsqueeze(-1).unsqueeze(-1)  # [B, num_q, 1, 1]
+        sigma_h = sigma_h.unsqueeze(-1).unsqueeze(-1)
+
+        gauss = torch.exp(
+            -0.5 * ((grid_x - cx) ** 2 / sigma_w ** 2
+                  + (grid_y - cy) ** 2 / sigma_h ** 2)
+        )  # [B, num_q, num_cams, H*W]
+        return gauss
+
+    def forward(self, query, key=None, value=None, residual=None,
+                query_pos=None, reference_points=None, ref_size=None,
+                img_metas=None, **kwargs):
+        """
+        Args:
+            query:            [num_q, B, embed_dims]
+            value:            list of [B, N, C, H_l, W_l]  (4 FPN levels)
+            reference_points: [B, num_q, 3]  normalised sigmoid space
+            ref_size:         [B, num_q, 3]  wlh in log space
+        Returns:
+            [num_q, B, embed_dims]
+        """
+        inp_residual = query
+        if query_pos is not None:
+            query = query + query_pos
+
+        num_q, B, _ = query.shape
+
+        # ── fuse all 4 FPN levels → [B, num_cams, embed_dims, H0, W0]
+        img_feat = self._fuse_fpn_levels(value)
+        H0, W0 = img_feat.shape[-2], img_feat.shape[-1]
+
+        # ── project reference points to camera planes
+        cx, cy, depth, valid, ref_3d = self._project_to_cameras(
+            reference_points, img_metas)
+        # cx, cy, valid: [B, num_q, num_cams]
+
+        # ── build Gaussian spatial masks [B, num_q, num_cams, H0*W0]
+        gauss = self._gaussian_mask(cx, cy, ref_size, H0, W0,
+                                    query.device, query.dtype)
+
+        # ── SMCA cross-attention per camera, then average
+        # query: [num_q, B, D] → [B, num_q, D]
+        q = self.q_proj(query.permute(1, 0, 2))  # [B, num_q, D]
+
+        accum = torch.zeros_like(q)
+        count = torch.zeros(B, num_q, 1, device=query.device, dtype=query.dtype)
+
+        for cam_idx in range(self.num_cams):
+            cam_feat = img_feat[:, cam_idx]  # [B, D, H0, W0]
+            # flatten spatial → [B, H0*W0, D]
+            kv_flat = cam_feat.flatten(2).permute(0, 2, 1)
+            k = self.k_proj(kv_flat)  # [B, H0*W0, D]
+            v = self.v_proj(kv_flat)
+
+            # raw attention logits [B, num_q, H0*W0]
+            attn = torch.bmm(q, k.transpose(1, 2)) * self.scale
+
+            # add log-Gaussian mask (in log domain = additive bias)
+            g = gauss[:, :, cam_idx, :]  # [B, num_q, H0*W0]
+            attn = attn + torch.log(g.clamp(min=1e-6))
+
+            attn = attn.softmax(dim=-1)  # [B, num_q, H0*W0]
+
+            # weighted sum of values [B, num_q, D]
+            out = torch.bmm(attn, v)
+
+            # mask invalid projections
+            cam_valid = valid[:, :, cam_idx].float().unsqueeze(-1)  # [B, num_q, 1]
+            accum = accum + out * cam_valid
+            count = count + cam_valid
+
+        # average over valid cameras
+        accum = accum / count.clamp(min=1.0)
+        accum = self.output_proj(accum)  # [B, num_q, D]
+
+        # position encoding from 3D ref points
+        pos_feat = self.position_encoder(
+            inverse_sigmoid(ref_3d))  # [B, num_q, D]
+
+        # back to [num_q, B, D]
+        out = accum.permute(1, 0, 2)
+        pos_feat = pos_feat.permute(1, 0, 2)
+
+        return self.dropout(out) + inp_residual + pos_feat
