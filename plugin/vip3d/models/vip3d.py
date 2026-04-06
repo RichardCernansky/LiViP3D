@@ -978,9 +978,9 @@ class ViP3D(MVXTwoStageDetector):
         # for bs 1;
         lidar2img = img_metas[0]['lidar2img']  # [T, num_cam]
         for i in range(num_frame):
-            points_single = [p_[i] for p_ in points]
+            points_single = [p_[i] for p_ in points] if points is not None else None
             img_single = torch.stack([img_[i] for img_ in img], dim=0)
-            radar_single = torch.stack([radar_[i] for radar_ in radar], dim=0)
+            radar_single = torch.stack([radar_[i] for radar_ in radar], dim=0) if radar is not None else None
 
             img_metas_single = deepcopy(img_metas)
             img_metas_single[0]['lidar2img'] = lidar2img[i]

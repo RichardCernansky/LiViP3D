@@ -3,7 +3,7 @@ import torch
 cam = torch.load('ckpt_init/detr3d_resnet50.pth', map_location='cpu')
 cam_state = cam['state_dict'] if 'state_dict' in cam else cam
 
-pts = torch.load('ckpt_init/checkpoint_epoch_20.pth', map_location='cpu')
+pts = torch.load('ckpt_init/pp_checkpoint_epoch_20.pth', map_location='cpu')
 pts_state = pts['model_state'] if 'model_state' in pts else pts
 
 print("=== LiDAR checkpoint keys (unique prefixes) ===")

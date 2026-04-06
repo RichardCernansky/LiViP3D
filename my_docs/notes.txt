@@ -1,7 +1,7 @@
+single feat from lower resolution FPN - strided are billinearly upsampled
 sine pos embeddings vs. learned pos. embeddings
 visualize the heatmap predictions agains ground truth
-Inference duplicate problem
-The fix — before top-K selection, zero out heatmap cells at the BEV grid locations of all active tracks. This costs almost nothing and guarantees the conflict never arises rather than relying on the model learning to suppress it.
+Inference duplicate problem - fix: before top-K selection, zero out heatmap cells at the BEV grid locations of all active tracks. This costs almost nothing and guarantees the conflict never arises rather than relying on the model learning to suppress it.
 
 COMMANDS
 # crete .PKL
