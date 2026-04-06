@@ -458,7 +458,7 @@ class ViP3D(MVXTwoStageDetector):
                 [track_instances.pred_boxes[:, 2:4],
                 track_instances.pred_boxes[:, 5:6]], dim=1)
 
-        # ── LiViP3D: fill empty slots + heatmap loss 
+        # ── add for LiViP3D: fill empty slots + heatmap loss 
         if self.use_lidar and pts_feats is not None:
             bev_feat = pts_feats[0] if isinstance(pts_feats, (list, tuple)) else pts_feats
             heatmap  = self.heatmap_head(bev_feat)          # [B, num_classes, H, W]
@@ -488,6 +488,11 @@ class ViP3D(MVXTwoStageDetector):
                     boxes_norm, labels_t, H_bev, W_bev, bev_feat.device)   # [K, H, W]
                 pred_hm    = heatmap[0].sigmoid()
 
+                # apply visibillity mask
+                vis_mask = self._build_camera_visibility_mask(
+                    H_bev, W_bev, img_metas, bev_feat.device)
+                gt_hm = gt_hm * vis_mask.unsqueeze(0).float()
+
                 pos_mask    = gt_hm.eq(1).float()
                 neg_weights = torch.pow(1 - gt_hm, 4)
                 pos_loss = torch.log(pred_hm.clamp(min=1e-6)) * torch.pow(1 - pred_hm, 2) * pos_mask
@@ -497,7 +502,7 @@ class ViP3D(MVXTwoStageDetector):
                 heatmap_loss = -(pos_loss.sum() + neg_loss.sum()) / num_pos
                 frame_idx = self.criterion._current_frame_idx
                 self.criterion.losses_dict[f'frame_{frame_idx}_heatmap_loss'] = heatmap_loss
-        # ── end LiViP3D ──────────────────────────────────────────────────────────
+        # ── end add for LiViP3D 
 
         # always runs regardless of use_lidar
         output_classes, output_coords, \
@@ -1387,9 +1392,14 @@ class ViP3D(MVXTwoStageDetector):
 
             # Gaussian radius from box footprint (wl = box[2:4] are log-size encoded;
             # use a fixed radius of 2 as a safe fallback for now)
-            radius = 2
+            w_m = np.exp(box[2])
+            l_m = np.exp(box[3])
+            w_cells = w_m / (vs[0] * sf)
+            l_cells = l_m / (vs[1] * sf)
+            radius = max(1, int(np.ceil(np.sqrt(w_cells**2 + l_cells**2) / 2)))
             diameter = 2 * radius + 1
             sigma = diameter / 6.0
+
             y_grid, x_grid = np.ogrid[-radius:radius + 1, -radius:radius + 1]
 
             # Produces a 5×5 bell shape — 1.0 at center, decays outward:

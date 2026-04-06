@@ -1,37 +1,7 @@
-select_topk_from_heatmap - even if slot selects pixels already tracked, slot will not be considered for tracking this object because it is not in the hungarian pool
-check loss if the average of the heatmap loss is correct
-
-gaussian const radius supervising might not be sufficient for different classes
-check if the x_m, y_m coor handling is correct
+sine pos embeddings vs. learned pos. embeddings
 visualize the heatmap predictions agains ground truth
-
 Inference duplicate problem
 The fix — before top-K selection, zero out heatmap cells at the BEV grid locations of all active tracks. This costs almost nothing and guarantees the conflict never arises rather than relying on the model learning to suppress it.
-
-TOUCHED IN vip3d.py
-
-imports — add import torch.nn.functional as F
-
----CONFIGSS---
-
-__init__ signature — add use_lidar=False, lidar_bev_channels=256, lidar_voxel_size=None, lidar_out_size_factor=4
-
-__init__ body — replace the if True: block (L141-144): conditionally create either query_embedding + reference_points (original) or category_embeds + heatmap_head + lidar_bev_proj (LiViP3D)
-
-_generate_empty_tracks — remove shape/device dependency on query_embedding; for lidar case initialize query and ref_pts as zeros (filled later from heatmap)
-
-_copy_tracks_for_loss — fix device reference: self.query_embedding.weight.device → self.bbox_size_fc.weight.device (two lines)
-
-extract_feat — add LiDAR branch: call extract_pts_feat when use_lidar=True and return bev_feats as third return value instead of None
-
-new method select_topk_from_heatmap — NMS via max pool, suppress active track locations, top-K selection, grid→metric→inverse sigmoid, sample BEV features, add category embedding, return ref_pts and queries
-
-new method _generate_gt_heatmap — draw Gaussian peaks on BEV grid from GT box centers for heatmap supervision
-
-_forward_single — after extract_feat, before pts_bbox_head: compute heatmap, fill empty slots with suppression, compute heatmap focal loss and store in criterion.losses_dict
-
-_inference_single — same slot-filling block as _forward_single but without heatmap loss (inference only)
-
 
 COMMANDS
 # crete .PKL
@@ -149,9 +119,93 @@ tools/train.py                  main()
   mmdet3d                         EpochBasedRunner.val()         → every 24 epochs
 
 
+ORDER OF OPERATIONS FOR CAMERA VISIBILITY
+forward_single()
+│
+├── 1. heatmap_head(bev_feat) → raw scores [B, 7, H, W]
+│
+├── 2. select_topk_from_heatmap()
+│   ├── scores = heatmap.sigmoid()
+│   ├── active track suppression            ← suppress already-tracked BEV cells
+│   ├── vis_mask = _build_camera_visibility_mask()
+│   │   └── projects each BEV cell into each camera
+│   │       valid = depth>0 & u∈[0,W] & v∈[0,H]
+│   │       returns [H,W] bool — True if ANY camera sees this cell
+│   ├── scores *= vis_mask                  ← MASK 1: zero rear-half peaks
+│   ├── NMS + topk → new query positions
+│   └── queries born only from front half ✅
+│
+├── 3. GT heatmap supervision (training only)
+│   ├── gt_hm = _generate_gt_heatmap()     ← box-size-aware Gaussian blobs
+│   ├── gt_hm *= vis_mask                  ← MASK 2: zero GT in rear half
+│   └── focal loss only on front-half GT ✅
+│
+└── pts_bbox_head → TransFusionDetHead → TransFusionTransformer
+    └── TransFusionTransformerDecoder
+        │
+        ├── LAYER 0: LiDAR BEV cross-attention
+        │   ├── self-attn
+        │   ├── LiDARBEVCrossAtten          ← NO masking, full 360° BEV as K/V
+        │   ├── FFN
+        │   └── _update_ref → new reference_points, ref_size
+        │
+        └── LAYER 1: SMCA camera cross-attention
+            ├── self-attn
+            └── SMCACrossAtten.forward()
+                ├── _fuse_fpn_levels()      ← 4 FPN levels → 1
+                ├── _project_to_cameras()
+                │   └── valid [B,num_q,num_cams]
+                │       depth>0 & cx∈[0,1] & cy∈[0,1]
+                ├── _compute_sigma()        ← project box corners → image-space sigma
+                ├── _gaussian_mask()        ← Gaussian blob per query per camera
+                │
+                └── [loop over 3 cameras]
+                    ├── attn = QK^T * scale + log(gaussian)
+                    ├── softmax(attn)
+                    ├── out = attn @ V
+                    ├── cam_valid = valid[:,:,cam_idx]
+                    ├── accum += out * cam_valid   ← MASK 3: zero invisible cams
+                    └── count += cam_valid
+                
+                accum /= count.clamp(min=1)  ← if count==0, accum stays zero
+                                              (invisible query gets zero cam update)
+                return dropout(out) + inp_residual + pos_feat
 
 
-  Gaussian Mask (most important difference)
+DIFFERENCES RESOLVED:
+TOUCHED IN vip3d.py
+
+imports — add import torch.nn.functional as F
+
+---CONFIGSS---
+
+__init__ signature — add use_lidar=False, lidar_bev_channels=256, lidar_voxel_size=None, lidar_out_size_factor=4
+
+__init__ body — replace the if True: block (L141-144): conditionally create either query_embedding + reference_points (original) or category_embeds + heatmap_head + lidar_bev_proj (LiViP3D)
+
+_generate_empty_tracks — remove shape/device dependency on query_embedding; for lidar case initialize query and ref_pts as zeros (filled later from heatmap)
+
+_copy_tracks_for_loss — fix device reference: self.query_embedding.weight.device → self.bbox_size_fc.weight.device (two lines)
+
+extract_feat — add LiDAR branch: call extract_pts_feat when use_lidar=True and return bev_feats as third return value instead of None
+
+new method select_topk_from_heatmap — NMS via max pool, suppress active track locations, top-K selection, grid→metric→inverse sigmoid, sample BEV features, add category embedding, return ref_pts and queries
+
+new method _generate_gt_heatmap — draw Gaussian peaks on BEV grid from GT box centers for heatmap supervision
+
+_forward_single — after extract_feat, before pts_bbox_head: compute heatmap, fill empty slots with suppression, compute heatmap focal loss and store in criterion.losses_dict
+
+_inference_single — same slot-filling block as _forward_single but without heatmap loss (inference only)
+
+PTS REFINEMENT HAPPENS IN BEV SPACE
+
+select_topk_from_heatmap - even if slot selects pixels already tracked, slot will not be considered for tracking this object because it is not in the hungarian pool
+check loss if the average of the heatmap loss is correct
+
+gaussian const radius supervising might not be sufficient for different classes
+check if the x_m, y_m coor handling is correct
+
+Gaussian Mask (most important difference)
 Original TransFusion:
 
 
@@ -178,4 +232,3 @@ Original always detaches ref points between layers. Yours detaches position alwa
 
 Multi-level FPN
 Original uses single-level BEV features. Yours explicitly fuses 4 FPN levels — this is the supervisor's requirement, not in the original paper.
-

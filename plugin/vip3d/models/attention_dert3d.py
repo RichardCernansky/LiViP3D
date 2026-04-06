@@ -657,21 +657,13 @@ class LiDARBEVCrossAtten(BaseModule):
             if bev_in_channels != embed_dims else nn.Identity()
         self.attn = nn.MultiheadAttention(embed_dims, num_heads, dropout=dropout)
         self.output_proj = nn.Linear(embed_dims, embed_dims)
-
-    def _make_bev_pos_embed(self, H, W, device, dtype):
-        """2D sine positional encoding → [H*W, 1, embed_dims]."""
-        y = torch.arange(H, device=device, dtype=dtype) / H
-        x = torch.arange(W, device=device, dtype=dtype) / W
-        # [H, W]
-        grid_y, grid_x = torch.meshgrid(y, x, indexing='ij')
-        dim = self.embed_dims // 4
-        inv_freq = 1.0 / (10000 ** (torch.arange(dim, device=device, dtype=dtype) / dim))
-        # [H*W, dim]
-        pe_x = torch.outer(grid_x.flatten(), inv_freq)
-        pe_y = torch.outer(grid_y.flatten(), inv_freq)
-        # [H*W, embed_dims]
-        pe = torch.cat([pe_x.sin(), pe_x.cos(), pe_y.sin(), pe_y.cos()], dim=-1)
-        return pe.unsqueeze(1)  # [H*W, 1, embed_dims]
+        # replaces _make_bev_pos_embed from sine/cosine to learnable conv-based positional embedding
+        self.bev_pos_embed = nn.Sequential(
+            nn.Conv1d(2, embed_dims, 1),
+            nn.BatchNorm1d(embed_dims),
+            nn.ReLU(),
+            nn.Conv1d(embed_dims, embed_dims, 1),
+        )
 
     def forward(self, query, key=None, value=None, residual=None,
                 query_pos=None, bev_feat=None, **kwargs):
@@ -687,9 +679,20 @@ class LiDARBEVCrossAtten(BaseModule):
             query = query + query_pos
 
         B, C, H, W = bev_feat.shape
+        # NEW
+        # build normalized (x,y) grid [2, H*W]
+        xs = torch.linspace(0, 1, W, device=bev_feat.device, dtype=bev_feat.dtype)
+        ys = torch.linspace(0, 1, H, device=bev_feat.device, dtype=bev_feat.dtype)
+        grid_y, grid_x = torch.meshgrid(ys, xs, indexing='ij')
+        grid = torch.stack([grid_x.flatten(), grid_y.flatten()], dim=0)  # [2, H*W]
+        grid = grid.unsqueeze(0).expand(B, -1, -1)  # [B, 2, H*W]
+
+        pos = self.bev_pos_embed(grid)              # [B, embed_dims, H*W]
+        pos = pos.permute(2, 0, 1)                  # [H*W, B, embed_dims]
+
+        # Project and add positional embedding to bev features 
         # [B, embed_dims, H, W] → [H*W, B, embed_dims]
-        bev = self.bev_proj(bev_feat.flatten(2).permute(2, 0, 1))
-        pos = self._make_bev_pos_embed(H, W, bev_feat.device, bev_feat.dtype)
+        bev = self.bev_proj(bev_feat.flatten(2).permute(2, 0, 1))  # [H*W, B, embed_dims]
         bev = bev + pos
 
         out, _ = self.attn(query=query, key=bev, value=bev)
@@ -791,38 +794,90 @@ class SMCACrossAtten(BaseModule):
         # transpose to [B, num_q, num_cam]
         return cx.permute(0, 2, 1), cy.permute(0, 2, 1), \
                depth.permute(0, 2, 1), valid.permute(0, 2, 1), ref_3d
+    
+    def _compute_sigma(self, reference_points, ref_size, img_metas, H_feat, W_feat):
+        """
+        Project box width/length as axis-aligned extents into feature-map pixel space,
+        compute circumscribed circle radius → sigma. Matches TransFusion's approach.
+        Returns [B, num_q, num_cams]
+        """
+        lidar2img = reference_points.new_tensor(
+            np.array([m['lidar2img'] for m in img_metas]))  # [B, num_cams, 4, 4]
 
-    def _gaussian_mask(self, cx, cy, ref_size, H, W, device, dtype):
-        """Build per-query Gaussian spatial mask on the feature map.
+        pc = self.pc_range
+        ref = reference_points.clone()
+        ref[..., 0] = ref[..., 0] * (pc[3] - pc[0]) + pc[0]
+        ref[..., 1] = ref[..., 1] * (pc[4] - pc[1]) + pc[1]
+        ref[..., 2] = ref[..., 2] * (pc[5] - pc[2]) + pc[2]
+
+        B, num_q = ref.shape[:2]
+        num_cams = lidar2img.shape[1]
+
+        wl = ref_size[..., :2].exp()       # [B, num_q, 2] metric w, l
+        hw = wl[..., 0:1] / 2             # half-width
+        hl = wl[..., 1:2] / 2             # half-length
+        z  = torch.zeros_like(hw)
+
+        # 5 points: center + 4 axis-aligned half-extents [B, num_q, 5, 4]
+        pts = torch.cat([
+            torch.cat([ref,                                    torch.ones_like(ref[..., :1])], -1).unsqueeze(2),
+            torch.cat([ref + torch.cat([ hw, z, z], -1),      torch.ones_like(ref[..., :1])], -1).unsqueeze(2),
+            torch.cat([ref + torch.cat([-hw, z, z], -1),      torch.ones_like(ref[..., :1])], -1).unsqueeze(2),
+            torch.cat([ref + torch.cat([z,  hl, z], -1),      torch.ones_like(ref[..., :1])], -1).unsqueeze(2),
+            torch.cat([ref + torch.cat([z, -hl, z], -1),      torch.ones_like(ref[..., :1])], -1).unsqueeze(2),
+        ], dim=2)  # [B, num_q, 5, 4]
+
+        # project into each camera
+        pts_e = pts.view(B, 1, num_q, 5, 4, 1).expand(-1, num_cams, -1, -1, -1, -1)
+        l2i   = lidar2img.view(B, num_cams, 1, 1, 4, 4).expand(-1, -1, num_q, 5, -1, -1)
+        pts_cam = torch.matmul(l2i, pts_e).squeeze(-1)  # [B, num_cams, num_q, 5, 4]
+
+        depth = pts_cam[..., 2].clamp(min=1e-5)
+        u = pts_cam[..., 0] / depth  # [B, num_cams, num_q, 5] in pixels
+        v = pts_cam[..., 1] / depth
+
+        img_h = img_metas[0]['img_shape'][0][0][0]
+        img_w = img_metas[0]['img_shape'][0][0][1]
+
+        # convert to feature-map pixel coords
+        u_feat = u / img_w * W_feat  # [B, num_cams, num_q, 5]
+        v_feat = v / img_h * H_feat
+
+        # extent of projected box in feature pixels
+        u_range = u_feat.amax(dim=-1) - u_feat.amin(dim=-1)  # [B, num_cams, num_q]
+        v_range = v_feat.amax(dim=-1) - v_feat.amin(dim=-1)
+
+        # minimum circumscribed circle radius → sigma (same formula as TransFusion)
+        radius = torch.ceil(torch.stack([u_range, v_range], dim=-1).norm(p=2, dim=-1) / 2)
+        sigma  = (radius * 2 + 1) / 6.0
+        sigma  = sigma.clamp(min=1.0)  # at least 1 feature pixel
+
+        return sigma.permute(0, 2, 1)  # [B, num_q, num_cams]
+
+
+    def _gaussian_mask(self, cx, cy, sigma, H, W, device, dtype):
+        """
         Args:
-            cx, cy:   [B, num_q, num_cams]  normalised centre
-            ref_size: [B, num_q, 3]         wlh in log space
+            cx, cy: [B, num_q, num_cams]  normalised [0,1]
+            sigma:  [B, num_q, num_cams]  in feature-map pixel units
         Returns:
             [B, num_q, num_cams, H*W]
         """
-        B, num_q, num_cams = cx.shape
-        wl = ref_size[..., :2].exp()  # [B, num_q, 2]  metric w, l
-        # rough sigma: box footprint projected to feature-map pixels
-        sigma_w = (wl[..., 0] / 20).clamp(0.02, 0.3)  # [B, num_q]
-        sigma_h = (wl[..., 1] / 20).clamp(0.02, 0.3)
-
-        # pixel grid [H, W]
-        gy = torch.linspace(0, 1, H, device=device, dtype=dtype)
-        gx = torch.linspace(0, 1, W, device=device, dtype=dtype)
+        gy = torch.linspace(0, H - 1, H, device=device, dtype=dtype)
+        gx = torch.linspace(0, W - 1, W, device=device, dtype=dtype)
         grid_y, grid_x = torch.meshgrid(gy, gx, indexing='ij')
-        grid_x = grid_x.flatten().view(1, 1, 1, -1)  # [1,1,1,H*W]
+        grid_x = grid_x.flatten().view(1, 1, 1, -1)  # [1, 1, 1, H*W]
         grid_y = grid_y.flatten().view(1, 1, 1, -1)
 
-        cx = cx.unsqueeze(-1)  # [B, num_q, num_cams, 1]
-        cy = cy.unsqueeze(-1)
-        sigma_w = sigma_w.unsqueeze(-1).unsqueeze(-1)  # [B, num_q, 1, 1]
-        sigma_h = sigma_h.unsqueeze(-1).unsqueeze(-1)
+        # convert normalised cx/cy to feature-map pixel coords
+        cx_pix = cx.unsqueeze(-1) * W   # [B, num_q, num_cams, 1]
+        cy_pix = cy.unsqueeze(-1) * H
+        sigma  = sigma.unsqueeze(-1)    # [B, num_q, num_cams, 1]
 
         gauss = torch.exp(
-            -0.5 * ((grid_x - cx) ** 2 / sigma_w ** 2
-                  + (grid_y - cy) ** 2 / sigma_h ** 2)
-        )  # [B, num_q, num_cams, H*W]
-        return gauss
+            -0.5 * ((grid_x - cx_pix) ** 2 + (grid_y - cy_pix) ** 2) / sigma ** 2
+        )
+        return gauss  # [B, num_q, num_cams, H*W]
 
     def forward(self, query, key=None, value=None, residual=None,
                 query_pos=None, reference_points=None, ref_size=None,
@@ -852,8 +907,8 @@ class SMCACrossAtten(BaseModule):
         # cx, cy, valid: [B, num_q, num_cams]
 
         # ── build Gaussian spatial masks [B, num_q, num_cams, H0*W0]
-        gauss = self._gaussian_mask(cx, cy, ref_size, H0, W0,
-                                    query.device, query.dtype)
+        sigma = self._compute_sigma(reference_points, ref_size, img_metas, H0, W0)
+        gauss = self._gaussian_mask(cx, cy, sigma, H0, W0, query.device, query.dtype)
 
         # ── SMCA cross-attention per camera, then average
         # query: [num_q, B, D] → [B, num_q, D]
@@ -897,5 +952,7 @@ class SMCACrossAtten(BaseModule):
         # back to [num_q, B, D]
         out = accum.permute(1, 0, 2)
         pos_feat = pos_feat.permute(1, 0, 2)
-
-        return self.dropout(out) + inp_residual + pos_feat
+        
+        # after Layer 0 puts the query out of scope of all cameras, return mask to indicate which queries have no valid camera view
+        no_cam_mask = (count.squeeze(-1) == 0)  # [B, num_q]  True 
+        return self.dropout(out) + inp_residual + pos_feat, no_cam_mask

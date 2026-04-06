@@ -451,21 +451,28 @@ class TransFusionTransformerDecoder(BaseModule):
 
         if reg_branches is not None:
             reference_points, ref_size = self._update_ref(
-                reg_branches[0], q, reference_points, ref_size, detach_size=False)
+                reg_branches[0], q, reference_points, ref_size, detach_size=True)
 
         intermediate.append(q)
         inter_ref.append(reference_points)
         inter_size.append(ref_size)
 
-        # ── Layer 1: SMCA camera cross-attention ─────────────────────────────
+        # ── Layer 1 ──
+        q_layer0 = q.clone()  # pure layer 0 output, before ANY layer 1 operations
+
         q2, _ = self.sa1(q + query_pos, q + query_pos, q)
         q = self.n1[0](q + q2)
-        # SMCA
-        q2 = self.ca1(q, value=value, query_pos=query_pos,
-                      reference_points=reference_points,
-                      ref_size=ref_size, **kwargs)
-        q = self.n1[1](q + q2)
+
+        ca1_out, no_cam_mask = self.ca1(q, value=value, query_pos=query_pos,
+                                        reference_points=reference_points,
+                                        ref_size=ref_size, **kwargs)
+        q = self.n1[1](q + ca1_out)
         q = self.n1[2](q + self.ff1(q.permute(1, 0, 2)).permute(1, 0, 2))
+
+        # invisible queries → fall back to pure layer 0 output
+        mask = no_cam_mask.permute(1, 0).unsqueeze(-1)  # [num_q, B, 1]
+        # take q_layer0 for queries with no valid camera view (mask=1), otherwise take q after SMCA cross-attn and FFN
+        q = torch.where(mask, q_layer0, q)
 
         if reg_branches is not None:
             reference_points, ref_size = self._update_ref(
