@@ -643,7 +643,7 @@ class Detr3DCrossAttenPetrFeature(BaseModule):
 
         return self.dropout(output) + inp_residual + pos_feat
 
-# LiVip3D add
+# LiVip add
 @ATTENTION.register_module()
 class LiDARBEVCrossAtten(BaseModule):
     """Cross-attention between object queries and LiDAR BEV feature map."""
@@ -700,6 +700,7 @@ class LiDARBEVCrossAtten(BaseModule):
         return self.dropout(out) + inp_residual
 
 
+# LiVip add
 @ATTENTION.register_module()
 class SMCACrossAtten(BaseModule):
     """Spatially Modulated Cross-Attention (SMCA) over multi-level camera FPN features."""
