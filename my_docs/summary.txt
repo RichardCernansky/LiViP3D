@@ -1,0 +1,180 @@
+LiViP3D — Changes from Original VIP3D
+=======================================
+
+Two variants exist:
+  - vip3d_resnet50_3cam  : original VIP3D adapted to 3 front cameras only (camera-only)
+  - livip3d_resnet50_3cam: full LiViP3D — adds LiDAR branch + TransFusion-style decoder
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+1. CAMERA VISIBILITY FILTERING  (vip3d.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Problem: original VIP3D was trained with 6 cameras (360° coverage). With only
+3 front cameras, ~50% of GT objects have no visual evidence. The model was still
+being supervised on them via the Hungarian matching loss.
+
+Changes:
+  - _build_camera_visibility_mask() [new method]
+      Projects a dense BEV grid into each camera plane.
+      Returns bool [H, W] — True if a BEV cell is visible in at least one camera.
+
+  - forward_train() GT filtering
+      Before initialize_for_single_clip(), each frame's GT boxes are projected
+      into all cameras. Only boxes visible in at least one camera (vis_mask) are
+      passed to the criterion. Invisible objects are excluded from Hungarian
+      matching, focal loss, and L1 regression loss entirely.
+
+  - Heatmap supervision masking (_forward_single / _inference_single)
+      gt_hm = gt_hm * vis_mask  — GT heatmap is zeroed outside camera FOV.
+      Prevents heatmap loss from supervising invisible BEV regions.
+
+  - Inference score masking (select_topk_from_heatmap)
+      scores = scores * vis_mask  — Heatmap peaks outside camera FOV are zeroed
+      before top-K selection, preventing detections behind the vehicle.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+2. LIDAR BRANCH  (vip3d.py + configs/livip3d_resnet50_3cam.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+New constructor parameters: use_lidar, lidar_bev_channels, lidar_voxel_size,
+lidar_out_size_factor.
+
+Config additions (livip3d only):
+  - pts_voxel_layer  : VoxelNet voxelizer (0.2m voxels, 20 pts/voxel)
+  - pts_voxel_encoder: PillarFeatureNet (5→64 channels)
+  - pts_middle_encoder: PointPillarsScatter
+  - pts_backbone     : SECOND (2 layers: 64→128→256)
+  - pts_neck         : SECONDFPN → [B, 384, 128, 128] BEV features
+
+extract_feat() now returns (img_feats, radar_feats, pts_feats) where pts_feats
+is the BEV tensor from the LiDAR branch, used in query init and cross-attention.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+3. HEATMAP-BASED QUERY INITIALISATION  (vip3d.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Original VIP3D: fixed learned nn.Embedding(num_query, embed_dims*2) — queries
+are always the same at the start of every frame regardless of the scene.
+
+LiViP3D (use_lidar=True):
+  New modules:
+    heatmap_head   : Conv2d(C,C,3) → BN → ReLU → Conv2d(C,num_classes,1)
+    lidar_bev_proj : Linear(bev_channels → embed_dims)
+    category_embeds: nn.Embedding(num_classes, embed_dims)
+
+  select_topk_from_heatmap() [new method]:
+    1. Sigmoid heatmap scores
+    2. Zero out cells at active track locations (5×5 suppression radius)
+    3. Apply camera visibility mask
+    4. 3×3 local-max NMS (skip for bicycle/pedestrian — classes 5,6)
+    5. Top-K across all classes
+    6. Convert grid (row, col) → metric (x, y) → inverse-sigmoid ref_pts [K, 3]
+    7. Sample BEV feature at peak cell + add category embedding → query [K, 2D]
+
+  _generate_gt_heatmap() [new method]:
+    CenterPoint-style Gaussian rendering of GT boxes onto BEV grid.
+    Gaussian radius derived from box footprint (w, l). Returns [num_cls, H, W].
+
+  Heatmap focal loss (inside _forward_single):
+    Standard CornerNet focal loss applied to heatmap with visibility masking.
+    Stored in criterion.losses_dict as frame_{i}_heatmap_loss.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+4. TRANSFUSION 2-LAYER DECODER  (transformer.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Original: single-type Detr3DCamTrackPlusTransformerDecoder — N identical layers,
+each doing DETR-style camera cross-attention.
+
+LiViP3D: TransFusionTransformerDecoder [new class] — 2 fixed, different layers:
+
+  Layer 0 — LiDAR BEV cross-attention
+    self-attn(queries) → cross-attn(queries, bev_feat) → FFN
+    → regression head → update reference_points and ref_size (detached)
+
+  Layer 1 — SMCA camera cross-attention
+    self-attn(queries) → SMCA cross-attn(queries, camera_feats) → FFN
+    Queries with no valid camera projection fall back to layer 0 output
+    (no_cam_mask fallback, see transformer.py:476)
+    → regression head → update reference_points and ref_size
+
+_update_ref() [new helper]:
+  Runs reg_branch on query features, adds delta to reference_points (sigmoid
+  space), accumulates ref_size. ref_size is detached after layer 0 to prevent
+  noisy gradients from cascading.
+
+TransFusionTransformer [new class]:
+  Wrapper that splits query_embed into (content, pos), expands for batch,
+  passes bev_feat through to the decoder.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+5. NEW ATTENTION MODULES  (attention_dert3d.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+LiDARBEVCrossAtten [new]:
+  Cross-attention between object queries and LiDAR BEV feature map.
+  - bev_proj: Linear(bev_channels → embed_dims)
+  - bev_pos_embed: Conv1d MLP on normalized (x,y) grid coordinates (learnable,
+    vs. fixed sine in original TransFusion)
+  - Standard MHA: Q=queries, K=V=projected BEV features + pos embed
+
+SMCACrossAtten [new] — Spatially Modulated Cross-Attention:
+  Multi-level camera feature fusion with per-query Gaussian spatial masking.
+  - _fuse_fpn_levels(): upsample levels 1-3 to level-0 size, concat along
+    channel dim [4C], project back to C via Linear(4C → C). Replaces iterating
+    over individual FPN levels in the original DETR3D attention.
+  - _project_to_cameras(): project 3D reference points through lidar2img matrices
+    to get (cx, cy, depth, valid) per query per camera.
+  - _compute_sigma(): derive Gaussian sigma from projected box corners (anisotropic
+    σ_w, σ_h based on predicted box size in image space).
+  - _gaussian_mask(): build [B, num_q, num_cams, H*W] Gaussian attention bias.
+  - Forward: per-camera cross-attn with log-Gaussian additive mask, average valid
+    cameras, return (output, no_cam_mask) where no_cam_mask flags queries with
+    zero valid camera projections.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+6. TRANSFUSION DETECTION HEAD  (head_plus_raw.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+TransFusionDetHead [new class, inherits DeformableDETR3DCamHeadTrackPlusRaw]:
+  Only forward() is overridden. Differences vs parent:
+  - Accepts bev_feat parameter and passes it to transformer
+  - Level embeddings are still added to camera features per-level before fusion
+    (redundant given _fuse_fpn_levels merges them, but harmless)
+  - Same cls/reg/direction/velo decoding branches as parent
+
+Base class DeformableDETR3DCamHeadTrackPlusRaw:
+  - Added bev_feat=None to forward() signature so VIP3D 3-cam eval does not
+    crash when called with bev_feat keyword.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+7. BUG FIXES  (vip3d.py)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+forward_test() null guards:
+  points_single = [p_[i] for p_ in points] if points is not None else None
+  radar_single  = ... if radar is not None else None
+  Required for camera-only configs that pass no points/radar tensors.
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+8. EVALUATION & VISUALISATION  (tools/)
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+tools/visualize_predictions.py [new]:
+  BEV visualisation of detections and predicted trajectories.
+  - Loads results from results_nusc.json and GT from NuScenes devkit
+  - Draws ego vehicle as oriented white box with yellow heading arrow
+  - Draws GT boxes (green), predicted boxes (class-coloured), trajectories (red)
+  - Best trajectory (highest prob) highlighted; others shown faded
+  - --score_thr, --num_samples, --version flags
+
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+WHAT STAYED THE SAME
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+- ClipMatcher loss (Hungarian matching + focal + L1) — no changes
+- QIM tracking update mechanism
+- Memory bank (MemoryBank class)
+- Trajectory prediction head (VectorNet predictor)
+- Dataset / pipeline / data loading
+- Training loop and evaluation script structure
