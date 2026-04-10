@@ -381,6 +381,7 @@ class TransFusionTransformer(BaseModule):
         return inter_states, inter_references, inter_box_sizes
 
 
+# LiVip add: custom decoder with 2 separate branches for ref points and box sizes, and special handling of invisible queries
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
 class TransFusionTransformerDecoder(BaseModule):
     """Custom 2-layer decoder: LiDAR BEV cross-attn + SMCA camera cross-attn."""

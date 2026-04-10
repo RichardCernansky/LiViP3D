@@ -458,12 +458,12 @@ class ViP3D(MVXTwoStageDetector):
                 [track_instances.pred_boxes[:, 2:4],
                 track_instances.pred_boxes[:, 5:6]], dim=1)
 
-        # ── add for LiViP3D: fill empty slots + heatmap loss 
+        # ── LiVip add: fill empty slots + heatmap loss 
         if self.use_lidar and pts_feats is not None:
             bev_feat = pts_feats[0] if isinstance(pts_feats, (list, tuple)) else pts_feats
             heatmap  = self.heatmap_head(bev_feat)          # [B, num_classes, H, W]
 
-            # 1. fill empty slots
+            # 1. fill so far empty slots
             empty_mask = track_instances.obj_idxes < 0
             num_empty  = int(empty_mask.sum())
             if num_empty > 0:
@@ -488,21 +488,26 @@ class ViP3D(MVXTwoStageDetector):
                     boxes_norm, labels_t, H_bev, W_bev, bev_feat.device)   # [K, H, W]
                 pred_hm    = heatmap[0].sigmoid()
 
-                # apply visibillity mask
+                # apply visibillity mask - heat map loss is only applied to visible objects
                 vis_mask = self._build_camera_visibility_mask(
                     H_bev, W_bev, img_metas, bev_feat.device)
                 gt_hm = gt_hm * vis_mask.unsqueeze(0).float()
 
+                # only exact peak cells get 1
                 pos_mask    = gt_hm.eq(1).float()
+                # the closer to exact peak -> weight close to 0
                 neg_weights = torch.pow(1 - gt_hm, 4)
+                
+                # focal loss with alpha=0.25, gamma=2.0
                 pos_loss = torch.log(pred_hm.clamp(min=1e-6)) * torch.pow(1 - pred_hm, 2) * pos_mask
                 neg_loss = torch.log((1 - pred_hm).clamp(min=1e-6)) * torch.pow(pred_hm, 2) \
                         * neg_weights * gt_hm.lt(1).float()
                 num_pos  = pos_mask.sum().clamp(min=1)
+                # normalize by the number of positive cells (exact peaks)
                 heatmap_loss = -(pos_loss.sum() + neg_loss.sum()) / num_pos
                 frame_idx = self.criterion._current_frame_idx
                 self.criterion.losses_dict[f'frame_{frame_idx}_heatmap_loss'] = heatmap_loss
-        # ── end add for LiViP3D 
+        # LiVip add end 
 
         # always runs regardless of use_lidar
         output_classes, output_coords, \
@@ -615,18 +620,52 @@ class ViP3D(MVXTwoStageDetector):
         track_instances = self._generate_empty_tracks()
 
         # init gt instances!
+        # init gt instances — filter to camera-visible objects only.
+        # Without this, objects outside all camera FOVs still enter the Hungarian
+        # matcher and generate cls + regression loss with zero visual evidence.
+        lidar2img_all = img_metas[0]['lidar2img']  # [T, num_cam, 4, 4]
+        img_h = img_metas[0]['img_shape'][0][0][0]
+        img_w = img_metas[0]['img_shape'][0][0][1]
+
+        # initialize GT instances for each frame
+        # then pass the list to criterion for per-frame matching and loss computation
         gt_instances_list = []
         for i in range(num_frame):
             gt_instances = Instances((1, 1))
-            boxes = gt_bboxes_3d[0][i].tensor.to(img.device)
-            # normalize gt bboxes here!
-            boxes = normalize_bbox(boxes, self.pc_range)
+            boxes_raw = gt_bboxes_3d[0][i].tensor.to(img.device)  # [N, 9+]
+
+            # LiViP add
+            # project GT box centers to each camera and filter out those invisible in all cameras
+            if len(boxes_raw) > 0:
+                centers = boxes_raw[:, :3]  # [N, 3] LiDAR coords
+                ones = torch.ones(len(centers), 1, device=img.device)
+                pts_h = torch.cat([centers, ones], dim=1)  # [N, 4]
+                l2i = torch.tensor(
+                    np.array(lidar2img_all[i]), dtype=torch.float32, device=img.device
+                )  # [num_cam, 4, 4]
+                pts_cam = torch.einsum('cij,nj->nci', l2i, pts_h)  # [N, num_cam, 4]
+                depth = pts_cam[..., 2]
+                u = pts_cam[..., 0] / depth.clamp(min=1e-5)
+                v = pts_cam[..., 1] / depth.clamp(min=1e-5)
+                visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
+                vis_mask = visible.any(dim=1)  # [N]
+            else:
+                vis_mask = torch.zeros(0, dtype=torch.bool, device=img.device)
+
+            boxes_vis = boxes_raw[vis_mask]
+            centers_vis = boxes_vis[:, :2].detach().cpu().numpy()  # (x, y) in LiDAR frame
+            # DEBUG print statements for GT visibility filtering
+            # print(f'[frame {i}] GT boxes: {len(boxes_raw)} total → {vis_mask.sum().item()} camera-visible')
+            # print(f'[frame {i}] visible centers (x=fwd, y=left): {np.round(centers_vis, 1).tolist()}')
+            boxes = normalize_bbox(boxes_vis, self.pc_range)
 
             gt_instances.boxes = boxes
-            gt_instances.labels = gt_labels_3d[0][i]
-            gt_instances.obj_ids = instance_inds[0][i]
+            gt_instances.labels = gt_labels_3d[0][i][vis_mask]
+            gt_instances.obj_ids = instance_inds[0][i][vis_mask]
             gt_instances_list.append(gt_instances)
 
+
+        # reset call at the start of each training sample
         self.criterion.initialize_for_single_clip(gt_instances_list)
 
         others_dict = {}

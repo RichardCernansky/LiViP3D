@@ -13,6 +13,7 @@ input_modality = dict(
 file_client_args = dict(backend='disk')
 train_pipeline = [
     dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(
         type='InstanceRangeFilter',
@@ -26,6 +27,7 @@ train_pipeline = [
 ]
 test_pipeline = [
     dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(
         type='NormalizeMultiviewImage',
         mean=[103.53, 116.28, 123.675],
@@ -101,6 +103,10 @@ data = dict(
         num_frames_per_sample=3,
         pipeline_single=[
             dict(type='LoadMultiViewImageFromFiles'),
+            dict(
+                type='ResizeMultiViewKeepRatio',
+                scale=(960, 544),
+                keep_ratio=True),
             dict(
                 type='LoadAnnotations3D',
                 with_bbox_3d=True,
@@ -184,6 +190,10 @@ data = dict(
         pipeline_single=[
             dict(type='LoadMultiViewImageFromFiles'),
             dict(
+                type='ResizeMultiViewKeepRatio',
+                scale=(960, 544),
+                keep_ratio=True),
+            dict(
                 type='NormalizeMultiviewImage',
                 mean=[103.53, 116.28, 123.675],
                 std=[1.0, 1.0, 1.0],
@@ -257,6 +267,10 @@ data = dict(
         box_type_3d='LiDAR',
         pipeline_single=[
             dict(type='LoadMultiViewImageFromFiles'),
+            dict(
+                type='ResizeMultiViewKeepRatio',
+                scale=(960, 544),
+                keep_ratio=True),
             dict(
                 type='NormalizeMultiviewImage',
                 mean=[103.53, 116.28, 123.675],

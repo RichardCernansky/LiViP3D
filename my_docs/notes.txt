@@ -3,19 +3,34 @@ sine pos embeddings vs. learned pos. embeddings
 visualize the heatmap predictions agains ground truth
 Inference duplicate problem - fix: before top-K selection, zero out heatmap cells at the BEV grid locations of all active tracks. This costs almost nothing and guarantees the conflict never arises rather than relying on the model learning to suppress it.
 
+
+ego vehicle vizualizacia co vidi + box - done
+EPA metrics
+projekcia GT bbox centrov na image planes - obmedzit na 3 kamery - done
+okomentovat kod a skontrolovat sanity (3 cam flow and masking, queries, loss computation)
+
+
 COMMANDS
 # crete .PKL
 python tools/data_converter/nusc_tracking.py
 # run the training 
 bash tools/dist_train.sh plugin/vip3d/configs/vip3d_resnet50_3cam.py 1 --work-dir=work_dirs/vip3d_resnet50_3cam
 PYTHONPATH=. bash tools/dist_train.sh plugin/vip3d/configs/livip3d_resnet50_3cam.py 1 --work-dir=work_dirs/livip3d_resnet50_3cam
+PYTHONPATH=. python tools/test.py   plugin/vip3d/configs/vip3d_resnet50_3cam.py   work_dirs/vip3d_resnet50_3cam/epoch_7.pth   --eval bbox   --out work_dirs/vip3d_resnet50_3cam/results.pkl
+python tools/prediction_eval.py   --result_path work_dirs/vip3d_resnet50_3cam/results_nusc.json   --prediction_infos_path nuscenes_prediction_infos_val.json
+python tools/visualize_predictions.py     --results work_dirs/vip3d_resnet50_3cam/results_nusc.json     --dataroot /mnt/hdd/cernanskyr/nuscenes     --out work_dirs/vip3d_resnet50_3cam/vis     --num_samples 20     --score_thr 0.3
 
 # watch the log
 tail -f work_dirs/vip3d_resnet50_3cam/*.log | grep -o "loss: [0-9.]*\|grad_norm: [0-9.]*\|lr: [0-9e.-]*"
 
 QUESTIONS 
+1.4.
 SMCA over full image feature maps - enough memory?
 use single FPN ? 
+9.4.
+mask loss only for vip3cam or also livip3cam?
+Pri inference by mal vidiet vsetky GT boxy alebo len 3cam viditelne?
+level encodings even when fusing FPN feats together?
 
 TODO:
 visualize predictions on baseline - evaluate

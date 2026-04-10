@@ -139,7 +139,7 @@ class DeformableDETR3DCamHeadTrackPlusRaw(nn.Module):
 
     # @auto_fp16(apply_to=('img', 'radar'))
     def forward(self, mlvl_feats, radar_feats,
-                query_embeds, ref_points, ref_size, img_metas, petr_feature=False):
+                query_embeds, ref_points, ref_size, img_metas, bev_feat=None, petr_feature=False):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): List of Features from the upstream
@@ -261,6 +261,7 @@ class DeformableDETR3DCamHeadTrackPlusRaw(nn.Module):
         return outputs_classes, outputs_coords, \
             last_query_feats, last_ref_points
 
+# LiVip add
 @HEADS.register_module()
 class TransFusionDetHead(DeformableDETR3DCamHeadTrackPlusRaw):
     """TransFusion 2-layer detection head (LiDAR BEV + SMCA camera).
@@ -269,7 +270,8 @@ class TransFusionDetHead(DeformableDETR3DCamHeadTrackPlusRaw):
 
     def forward(self, mlvl_feats, radar_feats, query_embeds, ref_points,
                 ref_size, img_metas, bev_feat=None, petr_feature=False):
-        # ── positional encoding on multi-level image features (same as parent)
+        
+        # positional encoding on multi-level image features (same as parent)
         batch_size = mlvl_feats[0].size(0)
         input_img_h, input_img_w = img_metas[0]['input_shape']
         img_masks = mlvl_feats[0].new_ones(
@@ -284,12 +286,14 @@ class TransFusionDetHead(DeformableDETR3DCamHeadTrackPlusRaw):
                 img_masks[None], size=feat.shape[-2:]).to(torch.bool).squeeze(0)
             pos_enc = self.positional_encoding(mlvl_masks)
             pos_enc = pos_enc.unsqueeze(1).repeat(1, N, 1, 1, 1)
+            # LiVpi Note: do not add lvl_embedding -> FPN features are fused
             lvl_enc = self.level_embeds[i].view(1, 1, -1, 1, 1)
             cam_enc = self.cam_embeds.view(1, N, C, 1, 1)
-            pos_enc = pos_enc + lvl_enc + cam_enc
+            # add positional encoding, camera embedding together
+            pos_enc = pos_enc + cam_enc
             mlvl_feats[i] = feat + pos_enc
 
-        # ── 2-layer TransFusion decoder
+        # 2-layer TransFusion decoder
         hs, inter_references, inter_box_sizes = self.transformer(
             mlvl_feats,
             query_embeds,
@@ -305,6 +309,7 @@ class TransFusionDetHead(DeformableDETR3DCamHeadTrackPlusRaw):
         outputs_classes = []
         outputs_coords = []
 
+        # detection head forward for each decoder layer; same as parent except for ref point handling
         from mmdet.models.utils.transformer import inverse_sigmoid as _inv_sig
         for lvl in range(hs.shape[0]):
             if lvl == 0:

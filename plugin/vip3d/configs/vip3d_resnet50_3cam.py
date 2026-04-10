@@ -166,6 +166,7 @@ file_client_args = dict(backend='disk')
 
 train_pipeline = [
     dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(type='InstanceRangeFilter', point_cloud_range=point_cloud_range),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
@@ -181,6 +182,7 @@ train_pipeline_post = [
 
 test_pipeline = [
     dict(type='LoadMultiViewImageFromFiles'),
+    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
 ]
