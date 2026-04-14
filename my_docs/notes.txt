@@ -27,15 +27,17 @@ QUESTIONS
 1.4.
 SMCA over full image feature maps - enough memory?
 use single FPN ? 
-9.4.
+for 14.4.
 mask loss only for vip3cam or also livip3cam?
-Pri inference by mal vidiet vsetky GT boxy alebo len 3cam viditelne?
+asi blbost inference nema gt - Pri inference by mal vidiet vsetky GT boxy alebo len 3cam viditelne?
 level encodings even when fusing FPN feats together?
 
 TODO:
 visualize predictions on baseline - evaluate
 put the resolution down, train baseline on resolution from chat config
 get single representation from FPN
+14.4
+cross attention to masked both lidar and cam
 
 PSEUDO
 INPUT: LiDAR points [N, 5], 3 camera images [3, 448, 800]
