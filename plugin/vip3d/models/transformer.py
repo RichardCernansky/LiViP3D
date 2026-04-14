@@ -445,7 +445,8 @@ class TransFusionTransformerDecoder(BaseModule):
         q2, _ = self.sa0(q + query_pos, q + query_pos, q)
         q = self.n0[0](q + q2)
         # LiDAR BEV cross-attention
-        q2 = self.ca0(q, query_pos=query_pos, bev_feat=bev_feat, **kwargs)
+        q2 = self.ca0(q, query_pos=query_pos, bev_feat=bev_feat,
+                      reference_points=reference_points, **kwargs)
         q = self.n0[1](q + q2)
         # FFN
         q = self.n0[2](q + self.ff0(q.permute(1, 0, 2)).permute(1, 0, 2))
