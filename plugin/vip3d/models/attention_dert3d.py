@@ -1058,7 +1058,7 @@ class LiDARBEVDeformCrossAtten(BaseModule):
         sampled = sampled.permute(0, 2, 3, 1)                     # [B, num_q, P, C_bev]
         sampled = self.bev_proj(sampled)                           # [B, num_q, P, D]
 
-        # ── attention weights ──────────────────────────────────────────────────
+        # attention weights 
         attn_w = self.attn_weight_pred(q_b)                       # [B, num_q, P]
         attn_w = attn_w.softmax(dim=-1).unsqueeze(-1)             # [B, num_q, P, 1]
 
@@ -1073,20 +1073,18 @@ class LiDARBEVDeformCrossAtten(BaseModule):
 # LiVip add: sparse camera cross-attention
 @ATTENTION.register_module()
 class SparseCamCrossAtten(BaseModule):
-    """Sparse camera cross-attention.
+    """Sparse camera cross-attention following the supervisor's DETR3D-style approach.
 
-    1. Fuse all 4 FPN levels into one feature map per camera (same as SMCACrossAtten).
-    2. For each query, project its 3D reference point into each camera and sample
-       exactly 1 pixel on the fused feature map (DETR3D-style).
-    3. Apply masked softmax over cameras (invalid projections → weight 0).
+    For each query, project its 3D reference point into each camera and sample
+    1 pixel per FPN level per camera — no level fusion, no dense attention.
+    Apply masked softmax over all valid (camera, level) pairs.
 
-    Complexity: O(Q * N_cam)  vs O(Q * H0 * W0 * N_cam) for dense SMCA.
+    Complexity: O(Q * N_cam * L)  vs O(Q * H0 * W0 * N_cam) for dense SMCA.
 
     Args:
         embed_dims: query/feature dimensionality
-        num_heads:  number of attention heads (used for the linear projections)
         num_cams:   number of cameras
-        num_levels: number of FPN levels to fuse
+        num_levels: number of FPN levels
         pc_range:   [x_min, y_min, z_min, x_max, y_max, z_max]
         dropout:    dropout probability
     """
@@ -1100,11 +1098,8 @@ class SparseCamCrossAtten(BaseModule):
         self.pc_range = pc_range
         self.dropout = nn.Dropout(dropout)
 
-        # fuse all FPN levels into single map per camera
-        self.fusion_proj = nn.Linear(num_levels * embed_dims, embed_dims)
-
-        # per-camera attention weight from query features
-        self.cam_attn_weight = nn.Linear(embed_dims, num_cams)
+        # learned weight for each (camera, level) pair
+        self.attn_weight_pred = nn.Linear(embed_dims, num_cams * num_levels)
         self.output_proj = nn.Linear(embed_dims, embed_dims)
 
         self.position_encoder = nn.Sequential(
@@ -1116,103 +1111,13 @@ class SparseCamCrossAtten(BaseModule):
             nn.ReLU(inplace=True),
         )
 
-    def _fuse_fpn_levels(self, mlvl_feats):
-        """Upsample levels 1-3 to level-0 size, concat, project.
-        Args:
-            mlvl_feats: list of [B, N, C, H_l, W_l]
-        Returns:
-            [B, N, embed_dims, H0, W0]
-        """
-        B, N, C, H0, W0 = mlvl_feats[0].shape
-        upsampled = [mlvl_feats[0]]
-        for feat in mlvl_feats[1:]:
-            f = feat.view(B * N, C, feat.shape[-2], feat.shape[-1])
-            f = F.interpolate(f, size=(H0, W0), mode='bilinear', align_corners=False)
-            upsampled.append(f.view(B, N, C, H0, W0))
-        fused = torch.cat(upsampled, dim=2)                       # [B, N, L*C, H0, W0]
-        fused = fused.permute(0, 1, 3, 4, 2)                     # [B, N, H0, W0, L*C]
-        fused = self.fusion_proj(fused)                           # [B, N, H0, W0, D]
-        return fused.permute(0, 1, 4, 2, 3)                      # [B, N, D, H0, W0]
-
-    def _project_and_sample(self, reference_points, img_feat, img_metas):
-        """Project 3D reference points into cameras and sample 1 pixel per camera.
-
-        Args:
-            reference_points: [B, num_q, 3]  normalised sigmoid space
-            img_feat:         [B, num_cams, D, H0, W0]  fused feature map
-            img_metas:        list of dicts
-
-        Returns:
-            sampled: [B, num_q, num_cams, D]
-            valid:   [B, num_q, num_cams]  bool
-            ref_3d:  [B, num_q, 3]         metric coords
-        """
-        lidar2img = reference_points.new_tensor(
-            np.array([m['lidar2img'] for m in img_metas]))        # [B, num_cams, 4, 4]
-
-        # de-normalise reference points to metric space
-        pc = self.pc_range
-        ref = reference_points.clone()
-        ref[..., 0] = ref[..., 0] * (pc[3] - pc[0]) + pc[0]
-        ref[..., 1] = ref[..., 1] * (pc[4] - pc[1]) + pc[1]
-        ref[..., 2] = ref[..., 2] * (pc[5] - pc[2]) + pc[2]
-        ref_3d = ref.clone()
-
-        B, num_q = ref.shape[:2]
-        num_cams = lidar2img.shape[1]
-        H0, W0 = img_feat.shape[-2], img_feat.shape[-1]
-
-        # homogeneous: [B, num_q, 4]
-        ref_h = torch.cat([ref, torch.ones_like(ref[..., :1])], dim=-1)
-        # broadcast project: [B, num_cams, num_q, 4]
-        ref_exp = ref_h.view(B, 1, num_q, 4, 1).expand(-1, num_cams, -1, -1, -1)
-        l2i = lidar2img.view(B, num_cams, 1, 4, 4).expand(-1, -1, num_q, -1, -1)
-        pts_cam = torch.matmul(l2i, ref_exp).squeeze(-1)          # [B, num_cams, num_q, 4]
-
-        depth = pts_cam[..., 2]                                   # [B, num_cams, num_q]
-        eps = 1e-5
-        pts2d = pts_cam[..., :2] / depth.unsqueeze(-1).clamp(min=eps)
-
-        img_h = img_metas[0]['img_shape'][0][0][0]
-        img_w = img_metas[0]['img_shape'][0][0][1]
-
-        # normalise to [0, 1] then to [-1, 1] for grid_sample
-        cx = pts2d[..., 0] / img_w                               # [B, num_cams, num_q]
-        cy = pts2d[..., 1] / img_h
-
-        valid = (depth > eps) & (cx > 0) & (cx < 1) & (cy > 0) & (cy < 1)
-        # [B, num_q, num_cams]
-        valid = valid.permute(0, 2, 1)
-
-        # grid_sample coordinates in [-1, 1]: [B, num_cams, num_q, 1, 2]
-        gx = (cx * 2 - 1).clamp(-1, 1)
-        gy = (cy * 2 - 1).clamp(-1, 1)
-        grid = torch.stack([gx, gy], dim=-1)                     # [B, num_cams, num_q, 2]
-        grid = grid.unsqueeze(3)                                  # [B, num_cams, num_q, 1, 2]
-
-        # sample: for each camera independently
-        # img_feat: [B, num_cams, D, H0, W0]
-        sampled_list = []
-        for c in range(num_cams):
-            feat_c = img_feat[:, c]                              # [B, D, H0, W0]
-            g_c = grid[:, c]                                     # [B, num_q, 1, 2]
-            # grid_sample: input [B, D, H0, W0], grid [B, num_q, 1, 2]
-            s = F.grid_sample(feat_c.float(), g_c.float(),
-                              mode='bilinear', align_corners=False,
-                              padding_mode='zeros')              # [B, D, num_q, 1]
-            sampled_list.append(s.squeeze(-1).permute(0, 2, 1)) # [B, num_q, D]
-
-        sampled = torch.stack(sampled_list, dim=2)               # [B, num_q, num_cams, D]
-
-        return sampled, valid, ref_3d
-
     def forward(self, query, key=None, value=None, residual=None,
                 query_pos=None, reference_points=None, ref_size=None,
                 img_metas=None, **kwargs):
         """
         Args:
             query:            [num_q, B, embed_dims]
-            value:            list of [B, N, C, H_l, W_l]  (4 FPN levels)
+            value:            list of L tensors, each [B, N_cam, C, H_l, W_l]
             reference_points: [B, num_q, 3]  normalised sigmoid space
         Returns:
             output:      [num_q, B, embed_dims]
@@ -1225,36 +1130,75 @@ class SparseCamCrossAtten(BaseModule):
         num_q, B, D = query.shape
         q_b = query.permute(1, 0, 2)  # [B, num_q, D]
 
-        # ── 1. fuse FPN levels ─────────────────────────────────────────────────
-        img_feat = self._fuse_fpn_levels(value)                  # [B, N, D, H0, W0]
+        # ── 1. project reference points into every camera (once, shared across levels) ──
+        lidar2img = reference_points.new_tensor(
+            np.array([m['lidar2img'] for m in img_metas]))        # [B, num_cams, 4, 4]
 
-        # ── 2. sparse sampling — 1 pixel per query per camera ─────────────────
-        sampled, valid, ref_3d = self._project_and_sample(
-            reference_points, img_feat, img_metas)
-        # sampled: [B, num_q, num_cams, D]
-        # valid:   [B, num_q, num_cams]
+        pc = self.pc_range
+        ref = reference_points.clone()
+        ref[..., 0] = ref[..., 0] * (pc[3] - pc[0]) + pc[0]
+        ref[..., 1] = ref[..., 1] * (pc[4] - pc[1]) + pc[1]
+        ref[..., 2] = ref[..., 2] * (pc[5] - pc[2]) + pc[2]
+        ref_3d = ref.clone()
 
-        # ── 3. per-camera attention weights with masked softmax ────────────────
-        cam_w = self.cam_attn_weight(q_b)                        # [B, num_q, num_cams]
-        # mask invalid cameras with a large negative value before softmax
-        INF = 1e9
-        cam_w = cam_w.masked_fill(~valid, -INF)
-        # if ALL cameras are invalid, softmax would give uniform weights → handled
-        # by no_cam_mask below; set to zero explicitly
-        all_invalid = ~valid.any(dim=-1, keepdim=True)           # [B, num_q, 1]
-        cam_w = cam_w.masked_fill(all_invalid.expand_as(cam_w), 0.0)
-        cam_w = cam_w.softmax(dim=-1)                            # [B, num_q, num_cams]
-        cam_w = cam_w * (~all_invalid).float()                   # zero rows with no cam
+        num_cams = lidar2img.shape[1]
+        ref_h = torch.cat([ref, torch.ones_like(ref[..., :1])], dim=-1)  # [B, num_q, 4]
+        ref_exp = ref_h.view(B, 1, num_q, 4, 1).expand(-1, num_cams, -1, -1, -1)
+        l2i = lidar2img.view(B, num_cams, 1, 4, 4).expand(-1, -1, num_q, -1, -1)
+        pts_cam = torch.matmul(l2i, ref_exp).squeeze(-1)          # [B, num_cams, num_q, 4]
 
-        # ── 4. weighted sum over cameras ──────────────────────────────────────
-        # cam_w: [B, num_q, num_cams, 1]; sampled: [B, num_q, num_cams, D]
-        out = (cam_w.unsqueeze(-1) * sampled).sum(dim=2)         # [B, num_q, D]
+        depth = pts_cam[..., 2]                                   # [B, num_cams, num_q]
+        eps = 1e-5
+        pts2d = pts_cam[..., :2] / depth.unsqueeze(-1).clamp(min=eps)
+
+        img_h = img_metas[0]['img_shape'][0][0][0]
+        img_w = img_metas[0]['img_shape'][0][0][1]
+
+        cx = pts2d[..., 0] / img_w                               # [B, num_cams, num_q]
+        cy = pts2d[..., 1] / img_h
+        valid = (depth > eps) & (cx > 0) & (cx < 1) & (cy > 0) & (cy < 1)
+        # [B, num_q, num_cams]
+        valid = valid.permute(0, 2, 1)
+
+        # grid_sample coords [-1, 1]: [B, num_cams, num_q, 1, 2]
+        gx = (cx * 2 - 1).clamp(-1, 1)
+        gy = (cy * 2 - 1).clamp(-1, 1)
+        # [B, num_cams, num_q, 1, 2]
+        grid = torch.stack([gx, gy], dim=-1).unsqueeze(3)
+
+        # ── 2. sample 1 pixel per (camera, level) — no fusion ─────────────────
+        # value: list of L tensors, each [B, N_cam, C, H_l, W_l]
+        sampled = []   # each entry [B, num_q, D]
+        valid_cl = []  # each entry [B, num_q]  (bool, same per level for same cam)
+
+        for lvl_feat in value:                                    # [B, N_cam, C, H_l, W_l]
+            for c in range(num_cams):
+                feat_c = lvl_feat[:, c]                          # [B, C, H_l, W_l]
+                g_c = grid[:, c]                                 # [B, num_q, 1, 2]
+                s = F.grid_sample(feat_c.float(), g_c.float(),
+                                  mode='bilinear', align_corners=False,
+                                  padding_mode='zeros')          # [B, C, num_q, 1]
+                sampled.append(s.squeeze(-1).permute(0, 2, 1))  # [B, num_q, C]
+                valid_cl.append(valid[:, :, c])                  # [B, num_q]
+
+        sampled  = torch.stack(sampled,  dim=2)                  # [B, num_q, N_cam*L, C]
+        valid_cl = torch.stack(valid_cl, dim=2)                  # [B, num_q, N_cam*L]
+
+        # ── 3. masked softmax over (camera, level) pairs ──────────────────────
+        attn_w = self.attn_weight_pred(q_b)                      # [B, num_q, N_cam*L]
+        attn_w = attn_w.masked_fill(~valid_cl, -1e9)
+        all_invalid = ~valid_cl.any(dim=-1, keepdim=True)        # [B, num_q, 1]
+        attn_w = attn_w.masked_fill(all_invalid.expand_as(attn_w), 0.0)
+        attn_w = attn_w.softmax(dim=-1)
+        attn_w = attn_w * (~all_invalid).float()                 # zero rows with no cam
+
+        # ── 4. weighted sum ───────────────────────────────────────────────────
+        out = (attn_w.unsqueeze(-1) * sampled).sum(dim=2)        # [B, num_q, C]
         out = self.output_proj(out)
 
-        # position encoding from 3D ref points
         pos_feat = self.position_encoder(inverse_sigmoid(ref_3d))  # [B, num_q, D]
 
-        out = out.permute(1, 0, 2)                               # [num_q, B, D]
+        out      = out.permute(1, 0, 2)                          # [num_q, B, D]
         pos_feat = pos_feat.permute(1, 0, 2)
 
         no_cam_mask = all_invalid.squeeze(-1)                    # [B, num_q]
