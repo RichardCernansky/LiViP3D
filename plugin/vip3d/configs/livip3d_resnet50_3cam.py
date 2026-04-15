@@ -250,7 +250,7 @@ test_pipeline_post = [
 
 data = dict(
     samples_per_gpu=1,
-    workers_per_gpu=2,
+    workers_per_gpu=4,
     train=dict(
         type=dataset_type,
         num_frames_per_sample=3,

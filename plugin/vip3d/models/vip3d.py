@@ -649,7 +649,10 @@ class ViP3D(MVXTwoStageDetector):
             gt_instances.obj_ids = instance_inds[0][i]
             gt_instances.vis_mask = vis_mask
             gt_instances_list.append(gt_instances)
-
+        #     print(f'[GT vis] frame {i}: {vis_mask.sum().item()}/{len(vis_mask)} visible')
+        # total = sum(len(g.vis_mask) for g in gt_instances_list)
+        # kept  = sum(g.vis_mask.sum().item() for g in gt_instances_list)
+        # print(f'[GT vis] clip total: {kept}/{total} visible ({100*kept//max(total,1)}%)')
 
         # reset call at the start of each training sample
         self.criterion.initialize_for_single_clip(gt_instances_list)

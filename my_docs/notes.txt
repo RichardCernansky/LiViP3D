@@ -32,9 +32,9 @@ QUESTIONS
 SMCA over full image feature maps - enough memory?
 use single FPN ? 
 for 14.4.
-masked loss should be masked only for vehicles appearing in < 3 frames. 
+loss is masked for vehicles appearing in the 3 cameras AT LEAST ONCE
 mask loss only for vip3cam or also livip3cam on 3 cameras??
-asi blbost inference nema gt - Pri inference by mal vidiet vsetky GT boxy alebo len 3cam viditelne?
+Pri inference by mal vidiet vsetky GT boxy alebo len 3cam viditelne - ak to staci na baseline vs. query-init porovnanie tak mozem pocitat metriky nad vsetkymi GT boxami?
 level encodings even when fusing FPN feats together?
 
 TODO:

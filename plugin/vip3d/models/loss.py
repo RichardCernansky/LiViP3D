@@ -189,6 +189,11 @@ class ClipMatcher(nn.Module):
         # [num_matched]
         mask = (target_obj_ids != -1)
 
+        # also exclude camera-invisible GT boxes from regression loss
+        if hasattr(gt_instances[0], 'vis_mask'):
+            target_vis = torch.cat([gt_per_img.vis_mask[i] for gt_per_img, (_, i) in zip(gt_instances, indices)], dim=0)
+            mask = mask & target_vis
+
         bbox_weights = torch.ones_like(target_boxes) * self.code_weights
         avg_factor = src_boxes[mask].size(0)
         avg_factor = reduce_mean(
@@ -230,6 +235,15 @@ class ClipMatcher(nn.Module):
         # [bs, num_query]
         target_classes[idx] = target_classes_o
         label_weights = torch.ones_like(target_classes)
+        # zero out classification loss for queries matched to camera-invisible GT boxes
+        if hasattr(gt_instances[0], 'vis_mask'):
+            for b_idx, (gt_per_img, (src_i, tgt_i)) in enumerate(zip(gt_instances, indices)):
+                if len(gt_per_img) > 0:
+                    valid = tgt_i != -1
+                    valid_src = src_i[valid]
+                    valid_tgt = tgt_i[valid]
+                    invis = ~gt_per_img.vis_mask[valid_tgt]
+                    label_weights[b_idx, valid_src[invis]] = 0
         # float tensor
         avg_factor = target_classes_o.numel()  # pos + mathced gt for disapper track
         avg_factor = reduce_mean(
