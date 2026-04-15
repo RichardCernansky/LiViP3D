@@ -16,10 +16,9 @@ python tools/data_converter/nusc_tracking.py
 # run the training 
 bash tools/dist_train.sh plugin/vip3d/configs/vip3d_resnet50_3cam.py 1 --work-dir=work_dirs/vip3d_resnet50_3cam
 PYTHONPATH=. bash tools/dist_train.sh plugin/vip3d/configs/livip3d_resnet50_3cam.py 1 --work-dir=work_dirs/livip3d_resnet50_3cam
-PYTHONPATH=. python tools/test.py   plugin/vip3d/configs/vip3d_resnet50_3cam.py   work_dirs/vip3d_resnet50_3cam/epoch_7.pth   --eval bbox   --out work_dirs/vip3d_resnet50_3cam/results.pkl
-
-Double GPU
+2 GPUs
 bash tools/dist_train.sh plugin/vip3d/configs/livip3d_resnet50_3cam.py 2 --work-dir work_dirs/livip3d_resnet50_3cam
+PYTHONPATH=. python tools/test.py   plugin/vip3d/configs/vip3d_resnet50_3cam.py   work_dirs/vip3d_resnet50_3cam/epoch_7.pth   --eval bbox   --out work_dirs/vip3d_resnet50_3cam/results.pkl
 
 
 python tools/prediction_eval.py   --result_path work_dirs/vip3d_resnet50_3cam/results_nusc.json   --prediction_infos_path nuscenes_prediction_infos_val.json
@@ -33,7 +32,8 @@ QUESTIONS
 SMCA over full image feature maps - enough memory?
 use single FPN ? 
 for 14.4.
-mask loss only for vip3cam or also livip3cam?
+masked loss should be masked only for vehicles appearing in < 3 frames. 
+mask loss only for vip3cam or also livip3cam on 3 cameras??
 asi blbost inference nema gt - Pri inference by mal vidiet vsetky GT boxy alebo len 3cam viditelne?
 level encodings even when fusing FPN feats together?
 
@@ -42,7 +42,8 @@ visualize predictions on baseline - evaluate
 put the resolution down, train baseline on resolution from chat config
 get single representation from FPN
 14.4
-cross attention to masked both lidar and cam
+cross attention to masked both lidar and cam zo source v teamse
+add camera visibility handling only for < 6 cameras.
 
 PSEUDO
 INPUT: LiDAR points [N, 5], 3 camera images [3, 448, 800]

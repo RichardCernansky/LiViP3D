@@ -620,48 +620,34 @@ class ViP3D(MVXTwoStageDetector):
         track_instances = self._generate_empty_tracks()
 
         # init gt instances!
-        # init gt instances — filter to camera-visible objects only.
-        # Without this, objects outside all camera FOVs still enter the Hungarian
-        # matcher and generate cls + regression loss with zero visual evidence.
-        lidar2img_all = img_metas[0]['lidar2img']  # [T, num_cam, 4, 4]
-        img_h = img_metas[0]['img_shape'][0][0][0]
-        img_w = img_metas[0]['img_shape'][0][0][1]
-
-        # initialize GT instances for each frame
-        # then pass the list to criterion for per-frame matching and loss computation
+        # Compute per-instance camera visibility once, store as vis_mask.
+        # All GT boxes stay in the count (keeps num_samples stable → stable loss
+        # normalisation), but loss_labels and loss_boxes will zero out invisible ones.
+        lidar2img_gt = img_metas[0]['lidar2img']  # list[T] of [num_cam, 4, 4]
+        img_h, img_w = img.shape[-2], img.shape[-1]
         gt_instances_list = []
         for i in range(num_frame):
             gt_instances = Instances((1, 1))
-            boxes_raw = gt_bboxes_3d[0][i].tensor.to(img.device)  # [N, 9+]
+            boxes = gt_bboxes_3d[0][i].tensor.to(img.device)
 
-            # LiViP add
-            # project GT box centers to each camera and filter out those invisible in all cameras
-            if len(boxes_raw) > 0:
-                centers = boxes_raw[:, :3]  # [N, 3] LiDAR coords
-                ones = torch.ones(len(centers), 1, device=img.device)
-                pts_h = torch.cat([centers, ones], dim=1)  # [N, 4]
-                l2i = torch.tensor(
-                    np.array(lidar2img_all[i]), dtype=torch.float32, device=img.device
-                )  # [num_cam, 4, 4]
+            if len(boxes) > 0:
+                centers = boxes[:, :3]
+                pts_h = torch.cat([centers, torch.ones(len(centers), 1, device=img.device)], dim=1)
+                l2i = torch.tensor(np.array(lidar2img_gt[i]), dtype=torch.float32, device=img.device)
                 pts_cam = torch.einsum('cij,nj->nci', l2i, pts_h)  # [N, num_cam, 4]
                 depth = pts_cam[..., 2]
                 u = pts_cam[..., 0] / depth.clamp(min=1e-5)
                 v = pts_cam[..., 1] / depth.clamp(min=1e-5)
                 visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
-                vis_mask = visible.any(dim=1)  # [N]
+                vis_mask = visible.any(dim=1)  # [N] True = visible in at least one camera
             else:
                 vis_mask = torch.zeros(0, dtype=torch.bool, device=img.device)
 
-            boxes_vis = boxes_raw[vis_mask]
-            centers_vis = boxes_vis[:, :2].detach().cpu().numpy()  # (x, y) in LiDAR frame
-            # DEBUG print statements for GT visibility filtering
-            # print(f'[frame {i}] GT boxes: {len(boxes_raw)} total → {vis_mask.sum().item()} camera-visible')
-            # print(f'[frame {i}] visible centers (x=fwd, y=left): {np.round(centers_vis, 1).tolist()}')
-            boxes = normalize_bbox(boxes_vis, self.pc_range)
-
+            boxes = normalize_bbox(boxes, self.pc_range)
             gt_instances.boxes = boxes
-            gt_instances.labels = gt_labels_3d[0][i][vis_mask]
-            gt_instances.obj_ids = instance_inds[0][i][vis_mask]
+            gt_instances.labels = gt_labels_3d[0][i]
+            gt_instances.obj_ids = instance_inds[0][i]
+            gt_instances.vis_mask = vis_mask
             gt_instances_list.append(gt_instances)
 
 
