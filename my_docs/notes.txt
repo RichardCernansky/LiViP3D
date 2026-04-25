@@ -31,11 +31,18 @@ QUESTIONS
 1.4.
 SMCA over full image feature maps - enough memory?
 use single FPN ? 
-for 14.4.
-loss is masked for vehicles appearing in the 3 cameras AT LEAST ONCE
-mask loss only for vip3cam or also livip3cam on 3 cameras??
+
+FOR 14.4.
+add GT trajectory to vis
+
+training effectivity?
+level encodings redundant when fusing FPN feats together? 
+mask GT loss only for vip3cam or also livip3cam on 3 cameras - YES??
 Pri inference by mal vidiet vsetky GT boxy alebo len 3cam viditelne - ak to staci na baseline vs. query-init porovnanie tak mozem pocitat metriky nad vsetkymi GT boxami?
-level encodings even when fusing FPN feats together?
+is dropping offsets really that unhelpful?
+if the queries are chosen from the pixels in the heatmap positive reqion, what is the chance for a ref_point to go often outside 
+focal for the whole map
+the 3cam visible space?
 
 TODO:
 visualize predictions on baseline - evaluate

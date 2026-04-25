@@ -1038,7 +1038,8 @@ class LiDARBEVDeformCrossAtten(BaseModule):
         offsets = offsets.tanh() * 0.5                            # clamp to ±0.5
 
         # sampling locations in [-1, 1] for F.grid_sample
-        sample_xy = ref_xy.unsqueeze(2) + offsets                 # [B, num_q, P, 2]
+        # livip add - discard + offsets no need for training the offsets
+        sample_xy = ref_xy.unsqueeze(2) # + offsets                  # [B, num_q, P, 2]
         sample_xy = sample_xy.clamp(0.0, 1.0)
         # grid_sample expects grid in [-1, 1]
         sample_grid = sample_xy * 2 - 1                           # [B, num_q, P, 2]

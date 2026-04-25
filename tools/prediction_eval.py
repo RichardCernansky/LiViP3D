@@ -4,6 +4,7 @@ import os
 from typing import List, Dict, Any
 
 import numpy as np
+from pyquaternion import Quaternion
 from scipy.optimize import linear_sum_assignment
 from tqdm import tqdm
 
@@ -127,6 +128,59 @@ def get_argmin_trajectory(future_traj, future_traj_is_valid, pred_future_trajs):
     minADE = delta.min()
 
     return argmin, minADE, minFDE
+
+
+def build_global2img(nusc, sample_token, camera_types):
+    """Build [num_cam, 4, 4] global-to-image projection matrices from NuScenes SDK."""
+    sample = nusc.get('sample', sample_token)
+    lidar_data = nusc.get('sample_data', sample['data']['LIDAR_TOP'])
+    ego_pose = nusc.get('ego_pose', lidar_data['ego_pose_token'])
+
+    R_e2g = Quaternion(ego_pose['rotation']).rotation_matrix  # ego → global
+    t_e2g = np.array(ego_pose['translation'])
+    R_g2e = R_e2g.T
+    t_g2e = -R_e2g.T @ t_e2g
+
+    matrices = []
+    for cam in camera_types:
+        if cam not in sample['data']:
+            continue
+        cam_data = nusc.get('sample_data', sample['data'][cam])
+        cam_cs = nusc.get('calibrated_sensor', cam_data['calibrated_sensor_token'])
+
+        R_c2e = Quaternion(cam_cs['rotation']).rotation_matrix  # cam → ego
+        t_c2e = np.array(cam_cs['translation'])
+        R_e2c = R_c2e.T
+        t_e2c = -R_c2e.T @ t_c2e
+
+        R_g2c = R_e2c @ R_g2e
+        t_g2c = R_e2c @ t_g2e + t_e2c
+
+        T_g2c = np.eye(4)
+        T_g2c[:3, :3] = R_g2c
+        T_g2c[:3, 3] = t_g2c
+
+        K = np.eye(4)
+        K[:3, :3] = np.array(cam_cs['camera_intrinsic'])
+
+        matrices.append(K @ T_g2c)
+
+    return np.array(matrices)  # [num_cam, 4, 4]
+
+
+def is_camera_visible(center_global, global2img, img_h=900, img_w=1600):
+    """Return True if the 3D global point projects into at least one camera."""
+    pt = np.array([center_global[0], center_global[1],
+                   center_global[2] if len(center_global) > 2 else 0.0, 1.0])
+    for mat in global2img:
+        p = mat @ pt
+        depth = p[2]
+        if depth <= 0:
+            continue
+        u, v = p[0] / depth, p[1] / depth
+        if 0 < u < img_w and 0 < v < img_h:
+            return True
+    return False
 
 
 def get_gt_agents(prediction_infos, index):

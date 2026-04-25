@@ -439,7 +439,7 @@ class TransFusionTransformerDecoder(BaseModule):
         inter_ref = []
         inter_size = []
 
-        # ── Layer 0: LiDAR BEV cross-attention ──────────────────────────────
+        # Layer 0: LiDAR BEV cross-attention 
         q = query
         # self-attention
         q2, _ = self.sa0(q + query_pos, q + query_pos, q)

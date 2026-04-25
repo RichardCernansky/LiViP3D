@@ -488,10 +488,10 @@ class ViP3D(MVXTwoStageDetector):
                     boxes_norm, labels_t, H_bev, W_bev, bev_feat.device)   # [K, H, W]
                 pred_hm    = heatmap[0].sigmoid()
 
-                # apply visibillity mask - heat map loss is only applied to visible objects
-                vis_mask = self._build_camera_visibility_mask(
-                    H_bev, W_bev, img_metas, bev_feat.device)
-                gt_hm = gt_hm * vis_mask.unsqueeze(0).float()
+                # don't apply visibillity mask - heat map loss is only applied to visible objects
+                # vis_mask = self._build_camera_visibility_mask(
+                #     H_bev, W_bev, img_metas, bev_feat.device)
+                # gt_hm = gt_hm * vis_mask.unsqueeze(0).float()
 
                 # only exact peak cells get 1
                 pos_mask    = gt_hm.eq(1).float()
@@ -620,6 +620,7 @@ class ViP3D(MVXTwoStageDetector):
         track_instances = self._generate_empty_tracks()
 
         # init gt instances!
+        # SUPERVISE VISIBLE GT INSTANCES
         # Compute per-instance camera visibility once, store as vis_mask.
         # All GT boxes stay in the count (keeps num_samples stable → stable loss
         # normalisation), but loss_labels and loss_boxes will zero out invisible ones.

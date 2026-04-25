@@ -290,7 +290,7 @@ class TransFusionDetHead(DeformableDETR3DCamHeadTrackPlusRaw):
             lvl_enc = self.level_embeds[i].view(1, 1, -1, 1, 1)
             cam_enc = self.cam_embeds.view(1, N, C, 1, 1)
             # add positional encoding, camera embedding together
-            pos_enc = pos_enc + cam_enc
+            pos_enc = pos_enc + cam_enc + lvl_enc
             mlvl_feats[i] = feat + pos_enc
 
         # 2-layer TransFusion decoder
