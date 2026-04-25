@@ -89,7 +89,25 @@ def draw_ego(ax, yaw):
                 zorder=6)
 
 
-def visualize_sample(ax, ego_xy, ego_yaw, pred_boxes, gt_boxes, score_thr):
+def get_gt_trajectories(nusc, token, num_future=12):
+    """Return list of (N, T, 2) GT future trajectories in global frame for a sample."""
+    sample = nusc.get('sample', token)
+    trajs = []
+    for ann_token in sample['anns']:
+        ann = nusc.get('sample_annotation', ann_token)
+        pts = []
+        cur = ann
+        for _ in range(num_future):
+            if cur['next'] == '':
+                break
+            cur = nusc.get('sample_annotation', cur['next'])
+            pts.append(cur['translation'][:2])
+        if pts:
+            trajs.append(np.array(pts))  # (T, 2)
+    return trajs
+
+
+def visualize_sample(ax, ego_xy, ego_yaw, pred_boxes, gt_boxes, gt_trajs, score_thr):
     ax.set_facecolor('#1a1a2e')
     ax.set_xlim(-RANGE, RANGE)
     ax.set_ylim(-RANGE, RANGE)
@@ -109,6 +127,14 @@ def visualize_sample(ax, ego_xy, ego_yaw, pred_boxes, gt_boxes, score_thr):
         yaw = quat_to_yaw(box['rotation'])
         draw_box_bev(ax, tx, ty, sz[0], sz[1], yaw,
                      color=GT_COLOR, alpha=0.6, linewidth=1.0)
+
+    # GT future trajectories
+    for traj in gt_trajs:
+        traj_local = traj - np.array(ego_xy)
+        ax.plot(traj_local[:, 0], traj_local[:, 1],
+                color=GT_COLOR, alpha=0.7, linewidth=1.2)
+        ax.plot(traj_local[-1, 0], traj_local[-1, 1],
+                'o', color=GT_COLOR, markersize=3, alpha=0.9)
 
     # Predicted boxes + trajectories
     for box in pred_boxes:
@@ -204,9 +230,11 @@ def main():
         ego_xy  = ego_pose['translation'][:2]
         ego_yaw = quat_to_yaw(ego_pose['rotation'])
 
+        gt_trajs = get_gt_trajectories(nusc, token)
+
         fig, ax = plt.subplots(1, 1, figsize=(8, 8))
         fig.patch.set_facecolor('#1a1a2e')
-        visualize_sample(ax, ego_xy, ego_yaw, pred_boxes, gt_boxes, args.score_thr)
+        visualize_sample(ax, ego_xy, ego_yaw, pred_boxes, gt_boxes, gt_trajs, args.score_thr)
         ax.set_title(f'Sample {i+1}: {token[:16]}...', color='white', fontsize=9)
 
         out_path = os.path.join(args.out, f'sample_{i+1:04d}.png')

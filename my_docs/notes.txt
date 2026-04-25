@@ -22,6 +22,9 @@ PYTHONPATH=. python tools/test.py   plugin/vip3d/configs/vip3d_resnet50_3cam.py 
 
 
 python tools/prediction_eval.py   --result_path work_dirs/vip3d_resnet50_3cam/results_nusc.json   --prediction_infos_path nuscenes_prediction_infos_val.json
+# with filtering 
+python tools/prediction_eval.py   --result_path work_dirs/vip3d_resnet50_3cam/results_nusc.json   --prediction_infos_path nuscenes_prediction_infos_val.json   --nusc_dataroot /mnt/hdd/cernanskyr/nuscenes    --nusc_version v1.0-trainval
+# visualize predictions
 python tools/visualize_predictions.py     --results work_dirs/vip3d_resnet50_3cam/results_nusc.json     --dataroot /mnt/hdd/cernanskyr/nuscenes     --out work_dirs/vip3d_resnet50_3cam/vis     --num_samples 20     --score_thr 0.3
 
 # watch the log
