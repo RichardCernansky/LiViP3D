@@ -680,7 +680,7 @@ def get_attention_cfg():
                 pc_range=point_cloud_range,
                 num_points=1,
                 embed_dims=256,
-                num_cams=3,
+                num_cams=6,
             )
         ],
         feedforward_channels=512,

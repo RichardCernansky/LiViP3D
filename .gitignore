@@ -4,3 +4,4 @@ work_dirs/
 data
 *.log
 *.pth
+runs

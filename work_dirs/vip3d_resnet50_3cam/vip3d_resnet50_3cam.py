@@ -297,7 +297,7 @@ dist_params = dict(backend='nccl')
 log_level = 'INFO'
 work_dir = 'work_dirs/vip3d_resnet50_3cam'
 load_from = 'ckpt_init/detr3d_resnet50.pth'
-resume_from = 'work_dirs/vip3d_resnet50_3cam/epoch_7.pth'
+resume_from = 'work_dirs/vip3d_resnet50_3cam/latest.pth'
 workflow = [('train', 1)]
 plugin = True
 plugin_dir = 'plugin/'

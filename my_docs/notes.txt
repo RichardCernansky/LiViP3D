@@ -55,6 +55,19 @@ get single representation from FPN
 cross attention to masked both lidar and cam zo source v teamse
 add camera visibility handling only for < 6 cameras.
 
+for 26.4.
+check fallback from SMCA stats on 3 cams
+stage the training like transfusion
+write the vip3d model architecture notes + livip edit notes
+should i do transfusion proposed architecture?
+if yes, how should i stage epochs if baseline was on 13 epochs? should i train the full 6 cam model?
+is running on 3 cameras worth it, run on 6 cams?
+
+30.4. run on
+CUDA_VISIBLE_DEVICES=1 bash tools/dist_train.sh plugin/vip3d/configs/livip3d_resnet50_3cam.py 1 --work-dir work_dirs/livip3d_resnet50_3cam
+also be aware of too big gradient if enabling training the backbone
+is it ok to filter out NAN boxes?
+
 PSEUDO
 INPUT: LiDAR points [N, 5], 3 camera images [3, 448, 800]
 

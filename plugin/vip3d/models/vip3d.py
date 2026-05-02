@@ -1,4 +1,5 @@
 import json
+import logging
 import os.path
 import pickle
 import random
@@ -24,6 +25,7 @@ from . import predictor_lib
 from .memory_bank import build_memory_bank
 from .qim import build_qim
 from .radar_encoder import build_radar_encoder
+from .bev_vis import visualize_bev
 from .. import utils as predictor_utils
 from ..structures import Instances
 
@@ -99,6 +101,7 @@ class ViP3D(MVXTwoStageDetector):
                  mem_cfg=None,
                  radar_encoder=None,
                  fix_feats=False,
+                 fix_lidar=False,
                  score_thresh=None,
                  filter_score_thresh=None,
                  use_grid_mask=False,
@@ -147,6 +150,12 @@ class ViP3D(MVXTwoStageDetector):
         self.bbox_size_fc = nn.Linear(self.embed_dims, 3)
 
         self.use_lidar = use_lidar
+        if fix_lidar and self.use_lidar:
+            for m in [self.pts_voxel_encoder, self.pts_middle_encoder,
+                      self.pts_backbone, self.pts_neck]:
+                if m is not None:
+                    for p in m.parameters():
+                        p.requires_grad_(False)
         if not self.use_lidar:
             # Original: fixed learnable query embeddings
             self.query_embedding = nn.Embedding(self.num_query, self.embed_dims * 2)
@@ -157,12 +166,28 @@ class ViP3D(MVXTwoStageDetector):
             self.lidar_voxel_size = lidar_voxel_size 
             self.lidar_out_size_factor = lidar_out_size_factor
             self.category_embeds = nn.Embedding(num_classes, embed_dims)
+            # heatmap_head: shared_conv (384→64, 3×3+BN+ReLU), pretrained from dense_head.shared_conv
             self.heatmap_head = nn.Sequential(
-                nn.Conv2d(lidar_bev_channels, lidar_bev_channels, 3, padding=1),
-                nn.BatchNorm2d(lidar_bev_channels),
+                nn.Conv2d(lidar_bev_channels, 64, 3, padding=1),
+                nn.BatchNorm2d(64),
                 nn.ReLU(inplace=True),
-                nn.Conv2d(lidar_bev_channels, num_classes, 1),
             )
+            # Per-task heatmap heads loaded directly from CenterPoint — no merging, no adaptation.
+            # task layout: 0=car(1), 1=truck+cveh(2), 2=bus+trailer(2), 4=moto+bike(2), 5=ped+cone(2)
+            # Forward slices: car=t0[:,0], truck=t1[:,0], bus=t2[:,0], trailer=t2[:,1],
+            #                 moto=t4[:,0], bike=t4[:,1], ped=t5[:,0]
+            def _task_head(n_cls):
+                return nn.Sequential(
+                    nn.Conv2d(64, 64, 3, padding=1),
+                    nn.BatchNorm2d(64),
+                    nn.ReLU(inplace=True),
+                    nn.Conv2d(64, n_cls, 3, padding=1),
+                )
+            self.hm_task0 = _task_head(1)   # car
+            self.hm_task1 = _task_head(2)   # truck, cveh
+            self.hm_task2 = _task_head(2)   # bus, trailer
+            self.hm_task4 = _task_head(2)   # motorcycle, bicycle
+            self.hm_task5 = _task_head(2)   # pedestrian, traffic_cone
             # Projects BEV channels → embed_dims for query content vector
             self.lidar_bev_proj = nn.Linear(lidar_bev_channels, embed_dims)
 
@@ -448,6 +473,11 @@ class ViP3D(MVXTwoStageDetector):
 
         B, num_cam, _, H, W = img.shape
 
+        if not hasattr(self, '_heatmap_verified'):
+            self._heatmap_verified = True
+            print(f'[verify] heatmap_head[0].weight.sum()={self.heatmap_head[0].weight.data.sum().item():.3f} (expected -2340.769)')
+            print(f'[verify] hm_task0[-1].bias={self.hm_task0[-1].bias.data.tolist()} (expected [-0.375])')
+
         #always run
         if True:
             # extract features - run all sensor backbones for the frame
@@ -461,7 +491,17 @@ class ViP3D(MVXTwoStageDetector):
         # ── LiVip add: fill empty slots + heatmap loss 
         if self.use_lidar and pts_feats is not None:
             bev_feat = pts_feats[0] if isinstance(pts_feats, (list, tuple)) else pts_feats
-            heatmap  = self.heatmap_head(bev_feat)          # [B, num_classes, H, W]
+            shared   = self.heatmap_head(bev_feat)                      # [B, 64, H, W]
+            t2 = self.hm_task2(shared); t4 = self.hm_task4(shared); t5 = self.hm_task5(shared)
+            heatmap  = torch.cat([                                      # [B, 7, H, W]
+                self.hm_task0(shared),          # car
+                self.hm_task1(shared)[:, :1],   # truck
+                t2[:, :1],                       # bus
+                t2[:, 1:],                       # trailer
+                t4[:, :1],                       # motorcycle
+                t4[:, 1:],                       # bicycle
+                t5[:, :1],                       # pedestrian
+            ], dim=1)
 
             # 1. fill so far empty slots
             empty_mask = track_instances.obj_idxes < 0
@@ -478,6 +518,7 @@ class ViP3D(MVXTwoStageDetector):
                 track_instances.query[empty_mask]   = new_queries
 
             # 2. heatmap supervision — independent of whether any slots were filled
+            gt_hm_vis = None
             if self.training and gt_bboxes_3d is not None and gt_labels_3d is not None:
                 H_bev, W_bev = heatmap.shape[2], heatmap.shape[3]
                 boxes_t    = gt_bboxes_3d[0].tensor.to(bev_feat.device) \
@@ -486,6 +527,7 @@ class ViP3D(MVXTwoStageDetector):
                 boxes_norm = normalize_bbox(boxes_t, self.pc_range)
                 gt_hm      = self._generate_gt_heatmap(
                     boxes_norm, labels_t, H_bev, W_bev, bev_feat.device)   # [K, H, W]
+                gt_hm_vis  = gt_hm
                 pred_hm    = heatmap[0].sigmoid()
 
                 # don't apply visibillity mask - heat map loss is only applied to visible objects
@@ -497,7 +539,7 @@ class ViP3D(MVXTwoStageDetector):
                 pos_mask    = gt_hm.eq(1).float()
                 # the closer to exact peak -> weight close to 0
                 neg_weights = torch.pow(1 - gt_hm, 4)
-                
+
                 # focal loss with alpha=0.25, gamma=2.0
                 pos_loss = torch.log(pred_hm.clamp(min=1e-6)) * torch.pow(1 - pred_hm, 2) * pos_mask
                 neg_loss = torch.log((1 - pred_hm).clamp(min=1e-6)) * torch.pow(pred_hm, 2) \
@@ -507,7 +549,9 @@ class ViP3D(MVXTwoStageDetector):
                 heatmap_loss = -(pos_loss.sum() + neg_loss.sum()) / num_pos
                 frame_idx = self.criterion._current_frame_idx
                 self.criterion.losses_dict[f'frame_{frame_idx}_heatmap_loss'] = heatmap_loss
-        # LiVip add end 
+
+            visualize_bev(bev_feat, heatmap, gt_hm_vis)
+        # LiVip add end
 
         # always runs regardless of use_lidar
         output_classes, output_coords, \
@@ -650,10 +694,10 @@ class ViP3D(MVXTwoStageDetector):
             gt_instances.obj_ids = instance_inds[0][i]
             gt_instances.vis_mask = vis_mask
             gt_instances_list.append(gt_instances)
-        #     print(f'[GT vis] frame {i}: {vis_mask.sum().item()}/{len(vis_mask)} visible')
-        # total = sum(len(g.vis_mask) for g in gt_instances_list)
-        # kept  = sum(g.vis_mask.sum().item() for g in gt_instances_list)
-        # print(f'[GT vis] clip total: {kept}/{total} visible ({100*kept//max(total,1)}%)')
+            print(f'[GT vis] frame {i}: {vis_mask.sum().item()}/{len(vis_mask)} visible')
+        total = sum(len(g.vis_mask) for g in gt_instances_list)
+        kept  = sum(g.vis_mask.sum().item() for g in gt_instances_list)
+        print(f'[GT vis] clip total: {kept}/{total} visible ({100*kept//max(total,1)}%)')
 
         # reset call at the start of each training sample
         self.criterion.initialize_for_single_clip(gt_instances_list)
@@ -709,6 +753,9 @@ class ViP3D(MVXTwoStageDetector):
                     for j in range(len(track_instances)):
                         obj_id = track_instances.obj_idxes[j].item()
                         if obj_id != -1 and obj_id != -2:
+                            if np.any(np.isnan(all_decoded_boxes[j])):
+                                logging.getLogger('mmdet').warning(f'[NaN box] filtered obj_id={obj_id} frame={i}')
+                                continue
                             track_ids.append(obj_id)
 
                             # clip
