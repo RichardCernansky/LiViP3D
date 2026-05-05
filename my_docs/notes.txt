@@ -67,6 +67,7 @@ is running on 3 cameras worth it, run on 6 cams?
 CUDA_VISIBLE_DEVICES=1 bash tools/dist_train.sh plugin/vip3d/configs/livip3d_resnet50_3cam.py 1 --work-dir work_dirs/livip3d_resnet50_3cam
 also be aware of too big gradient if enabling training the backbone
 is it ok to filter out NAN boxes?
+loss_scale hyperparameter search?
 
 PSEUDO
 INPUT: LiDAR points [N, 5], 3 camera images [3, 448, 800]
