@@ -7,7 +7,7 @@ Launch viewer:  tensorboard --logdir runs/bev_vis
 import torch
 import torch.distributed as dist
 
-ENABLED      = False # set False to skip all visualization
+ENABLED      = False  # set True to enable TensorBoard BEV visualization
 VIS_INTERVAL = 20   # _forward_single calls between log events
 _CLASS_NAMES = ['car', 'truck', 'bus', 'trailer', 'motorcycle', 'bicycle', 'pedestrian']
 

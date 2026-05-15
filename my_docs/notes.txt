@@ -16,11 +16,15 @@ python tools/data_converter/nusc_tracking.py
 # run the training 
 bash tools/dist_train.sh plugin/vip3d/configs/vip3d_resnet50_3cam.py 1 --work-dir=work_dirs/vip3d_resnet50_3cam
 PYTHONPATH=. bash tools/dist_train.sh plugin/vip3d/configs/livip3d_resnet50_3cam.py 1 --work-dir=work_dirs/livip3d_resnet50_3cam
+
 2 GPUs
 bash tools/dist_train.sh plugin/vip3d/configs/livip3d_resnet50_3cam.py 2 --work-dir work_dirs/livip3d_resnet50_3cam
+
+RESUME
+CUDA_VISIBLE_DEVICES=1 bash tools/dist_train.sh plugin/vip3d/configs/livip3d_resnet50_3cam.py 1 --work-dir=work_dirs/livip3d_resnet50_3cam --resume-from work_dirs/livip3d_resnet50_3cam/latest.pth
+bash tools/dist_train.sh plugin/vip3d/configs/livip3d_resnet50_3cam.py 2 --work-dir=work_dirs/livip3d_resnet50_3cam --resume-from work_dirs/livip3d_resnet50_3cam/latest.pth
+
 PYTHONPATH=. python tools/test.py   plugin/vip3d/configs/vip3d_resnet50_3cam.py   work_dirs/vip3d_resnet50_3cam/epoch_7.pth   --eval bbox   --out work_dirs/vip3d_resnet50_3cam/results.pkl
-
-
 python tools/prediction_eval.py   --result_path work_dirs/vip3d_resnet50_3cam/results_nusc.json   --prediction_infos_path nuscenes_prediction_infos_val.json
 # with filtering 
 python tools/prediction_eval.py   --result_path work_dirs/vip3d_resnet50_3cam/results_nusc.json   --prediction_infos_path nuscenes_prediction_infos_val.json   --nusc_dataroot /mnt/hdd/cernanskyr/nuscenes    --nusc_version v1.0-trainval

@@ -194,6 +194,7 @@ model = dict(
                 pc_range=point_cloud_range)
         )
     ),
+
 )
 
 dataset_type = 'NuScenesTrackDatasetRadar'
@@ -317,4 +318,4 @@ runner = dict(type='EpochBasedRunner', max_epochs=24)
 
 find_unused_parameters = True
 load_from = 'ckpt_init/livip3d_init.pth'
-# fp16 = dict(loss_scale=128.)
+# fp16 = dict(loss_scale='dynamic')

@@ -334,7 +334,7 @@ class ViP3D(MVXTwoStageDetector):
             img_feats_reshaped.append(img_feat.view(B, int(BN / B), C, H, W))
         return img_feats_reshaped
 
-    @auto_fp16(apply_to=('img'), out_fp32=True)
+    @auto_fp16(apply_to=('img', 'points', 'radar'), out_fp32=True)
     def extract_feat(self, points, img, radar=None, img_metas=None):
         """Extract features from images and points."""
         if radar is not None:
@@ -454,7 +454,7 @@ class ViP3D(MVXTwoStageDetector):
                 self.predictor.decoder.do_eval = True
             return self.forward_test(**kwargs)
 
-    # @auto_fp16(apply_to=('img', 'radar'))
+    @auto_fp16(apply_to=('img', 'radar', 'points'))
     def _forward_single(self, points, img, radar, img_metas, track_instances,
                         l2g_r1=None, l2g_t1=None, l2g_r2=None, l2g_t2=None,
                         time_delta=None, is_last_frame=False,
@@ -550,7 +550,7 @@ class ViP3D(MVXTwoStageDetector):
                 frame_idx = self.criterion._current_frame_idx
                 self.criterion.losses_dict[f'frame_{frame_idx}_heatmap_loss'] = heatmap_loss
 
-            visualize_bev(bev_feat, heatmap, gt_hm_vis)
+            # visualize_bev(bev_feat, heatmap, gt_hm_vis)
         # LiVip add end
 
         # always runs regardless of use_lidar
@@ -675,18 +675,19 @@ class ViP3D(MVXTwoStageDetector):
             gt_instances = Instances((1, 1))
             boxes = gt_bboxes_3d[0][i].tensor.to(img.device)
 
-            if len(boxes) > 0:
-                centers = boxes[:, :3]
-                pts_h = torch.cat([centers, torch.ones(len(centers), 1, device=img.device)], dim=1)
-                l2i = torch.tensor(np.array(lidar2img_gt[i]), dtype=torch.float32, device=img.device)
-                pts_cam = torch.einsum('cij,nj->nci', l2i, pts_h)  # [N, num_cam, 4]
-                depth = pts_cam[..., 2]
-                u = pts_cam[..., 0] / depth.clamp(min=1e-5)
-                v = pts_cam[..., 1] / depth.clamp(min=1e-5)
-                visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
-                vis_mask = visible.any(dim=1)  # [N] True = visible in at least one camera
-            else:
-                vis_mask = torch.zeros(0, dtype=torch.bool, device=img.device)
+            # if len(boxes) > 0:
+            #     centers = boxes[:, :3]
+            #     pts_h = torch.cat([centers, torch.ones(len(centers), 1, device=img.device)], dim=1)
+            #     l2i = torch.tensor(np.array(lidar2img_gt[i]), dtype=torch.float32, device=img.device)
+            #     pts_cam = torch.einsum('cij,nj->nci', l2i, pts_h)  # [N, num_cam, 4]
+            #     depth = pts_cam[..., 2]
+            #     u = pts_cam[..., 0] / depth.clamp(min=1e-5)
+            #     v = pts_cam[..., 1] / depth.clamp(min=1e-5)
+            #     visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
+            #     vis_mask = visible.any(dim=1)  # [N] True = visible in at least one camera
+            # else:
+            #     vis_mask = torch.zeros(0, dtype=torch.bool, device=img.device)
+            vis_mask = torch.ones(len(boxes), dtype=torch.bool, device=img.device)
 
             boxes = normalize_bbox(boxes, self.pc_range)
             gt_instances.boxes = boxes
@@ -1238,37 +1239,58 @@ class ViP3D(MVXTwoStageDetector):
 
         return [result_dict]
 
+    # PROFILING
+    # def train_step(self, data, optimizer):
+    #         # ── one-shot profiler ──────────────────────────────────────────────
+    #         if not hasattr(self, '_prof_counter'):
+    #             self._prof_counter = 0
+    #             self._prof = torch.profiler.profile(
+    #                 activities=[
+    #                     torch.profiler.ProfilerActivity.CPU,
+    #                     torch.profiler.ProfilerActivity.CUDA,
+    #                 ],
+    #                 schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
+    #                 on_trace_ready=torch.profiler.tensorboard_trace_handler('./prof_trace'),
+    #                 record_shapes=True,
+    #                 with_stack=False,        # set True if you want line numbers (slower)
+    #                 profile_memory=False,
+    #             )
+    #             self._prof.__enter__()
+
+    #         losses, others_dict = self(**data)
+    #         loss, log_vars = self._parse_losses(losses)
+
+    #         self._prof.step()
+    #         self._prof_counter += 1
+            
+    #         if self._prof_counter == 5:      # wait(1) + warmup(1) + active(3)
+    #             self._prof.__exit__(None, None, None)
+                
+    #             # 1. Print the CPU-sorted table to the console
+    #             print(self._prof.key_averages(group_by_stack_n=5).table(
+    #                 sort_by="self_cpu_time_total", row_limit=30))
+                
+    #             import sys; sys.exit(0)
+    #         # ───────────────────────────────────────────────────────────────────
+
+    #         outputs = dict(
+    #             loss=loss, log_vars=log_vars, num_samples=len(data['img_metas']))
+    #         outputs.update(others_dict)
+    #         return outputs
+
     def train_step(self, data, optimizer):
-        """The iteration step during training.
-
-        This method defines an iteration step during training, except for the
-        back propagation and optimizer updating, which are done in an optimizer
-        hook. Note that in some complicated cases or models, the whole process
-        including back propagation and optimizer updating is also defined in
-        this method, such as GAN.
-
-        Args:
-            data (dict): The output of dataloader.
-            optimizer (:obj:`torch.optim.Optimizer` | dict): The optimizer of
-                runner is passed to ``train_step()``. This argument is unused
-                and reserved.
-
-        Returns:
-            dict: It should contain at least 3 keys: ``loss``, ``log_vars``, \
-                ``num_samples``.
-
-                - ``loss`` is a tensor for back propagation, which can be a weighted sum of multiple losses.
-                - ``log_vars`` contains all the variables to be sent to the logger.
-                - ``num_samples`` indicates the batch size (when the model is DDP, it means the batch size on each GPU), which is used for averaging the logs.
-        """
+        # Core model logic remains
         losses, others_dict = self(**data)
         loss, log_vars = self._parse_losses(losses)
 
+        # Output formatting
         outputs = dict(
-            loss=loss, log_vars=log_vars, num_samples=len(data['img_metas']))
-
+            loss=loss, 
+            log_vars=log_vars, 
+            num_samples=len(data['img_metas'])
+        )
         outputs.update(others_dict)
-
+        
         return outputs
 
     def output_embedding_forward(self, output_embedding):
@@ -1433,6 +1455,7 @@ class ViP3D(MVXTwoStageDetector):
     def _generate_gt_heatmap(self, gt_boxes, gt_labels, H, W, device):
         """
         Generate CenterPoint-style Gaussian heatmaps from GT 3D boxes.
+        Fully on-GPU — no CPU transfers, no Python loops over boxes.
 
         Args:
             gt_boxes  (Tensor): [N, 10+] normalized boxes (output of normalize_bbox)
@@ -1443,55 +1466,68 @@ class ViP3D(MVXTwoStageDetector):
         Returns:
             gt_heatmap (Tensor): [num_classes, H, W]  values in [0, 1]
         """
-        gt_heatmap = np.zeros((self.num_classes, H, W), dtype=np.float32)
-        pc_range  = self.pc_range
-        vs        = self.lidar_voxel_size
-        sf        = self.lidar_out_size_factor
+        gt_heatmap = torch.zeros((self.num_classes, H, W), dtype=torch.float32, device=device)
+        if len(gt_boxes) == 0:
+            return gt_heatmap
 
-        for box, label in zip(gt_boxes.cpu().numpy(), gt_labels.cpu().numpy()):
-            cls = int(label)
-            if cls < 0 or cls >= self.num_classes:
-                continue
+        pc_range = self.pc_range
+        vs       = self.lidar_voxel_size
+        sf       = self.lidar_out_size_factor
 
-            # values in meters
-            # box[:2] are normalized x,y — denormalize to metric
-            x_m = box[0]
-            y_m = box[1]
+        # filter invalid classes
+        valid = (gt_labels >= 0) & (gt_labels < self.num_classes)
+        gt_boxes  = gt_boxes[valid]
+        gt_labels = gt_labels[valid]
+        if len(gt_boxes) == 0:
+            return gt_heatmap
 
-            # Metric → grid
-            col = (x_m - pc_range[0]) / (vs[0] * sf)
-            row = (y_m - pc_range[1]) / (vs[1] * sf)
-            col_i, row_i = int(col), int(row)
+        # box[:2] are normalized x,y from normalize_bbox — denormalize to metric
+        x_m = gt_boxes[:, 0]
+        y_m = gt_boxes[:, 1]
 
-            if not (0 <= col_i < W and 0 <= row_i < H):
-                continue
+        col = (x_m - pc_range[0]) / (vs[0] * sf)   # [N]
+        row = (y_m - pc_range[1]) / (vs[1] * sf)   # [N]
+        col_i = col.long()
+        row_i = row.long()
 
-            # Gaussian radius from box footprint (wl = box[2:4] are log-size encoded;
-            # use a fixed radius of 2 as a safe fallback for now)
-            w_m = np.exp(box[2])
-            l_m = np.exp(box[3])
-            w_cells = w_m / (vs[0] * sf)
-            l_cells = l_m / (vs[1] * sf)
-            radius = max(1, int(np.ceil(np.sqrt(w_cells**2 + l_cells**2) / 2)))
-            diameter = 2 * radius + 1
-            sigma = diameter / 6.0
+        # filter out-of-bounds centers
+        in_bounds = (col_i >= 0) & (col_i < W) & (row_i >= 0) & (row_i < H)
+        gt_boxes  = gt_boxes[in_bounds]
+        gt_labels = gt_labels[in_bounds]
+        col_i     = col_i[in_bounds]
+        row_i     = row_i[in_bounds]
+        if len(gt_boxes) == 0:
+            return gt_heatmap
 
-            y_grid, x_grid = np.ogrid[-radius:radius + 1, -radius:radius + 1]
+        # radius per box from its footprint
+        w_cells = gt_boxes[:, 2].exp() / (vs[0] * sf)
+        l_cells = gt_boxes[:, 3].exp() / (vs[1] * sf)
+        radii   = ((w_cells ** 2 + l_cells ** 2).sqrt() / 2).ceil().clamp(min=1).long()  # [N]
 
-            # Produces a 5×5 bell shape — 1.0 at center, decays outward:
-            gaussian = np.exp(-(x_grid ** 2 + y_grid ** 2) / (2 * sigma ** 2))
-            gaussian[gaussian < np.finfo(gaussian.dtype).eps * gaussian.max()] = 0
+        # build a shared grid large enough for the max radius
+        max_r = radii.max().item()
+        ax = torch.arange(-max_r, max_r + 1, device=device, dtype=torch.float32)  # [D]
+        yg, xg = torch.meshgrid(ax, ax, indexing='ij')  # [D, D]
 
-            r0, c0 = row_i, col_i
-            # figure out where it will be stored and handle the borders
-            top    = max(0, r0 - radius);  bottom = min(H, r0 + radius + 1)
-            left   = max(0, c0 - radius);  right  = min(W, c0 + radius + 1)
-            g_top  = top  - (r0 - radius); g_bottom = g_top + (bottom - top)
-            g_left = left - (c0 - radius); g_right  = g_left + (right - left)
+        for n in range(len(gt_boxes)):
+            r   = radii[n].item()
+            sigma = (2 * r + 1) / 6.0
+            # slice the shared grid to the actual radius for this box
+            offset = max_r - r
+            yg_n = yg[offset: offset + 2 * r + 1, offset: offset + 2 * r + 1]
+            xg_n = xg[offset: offset + 2 * r + 1, offset: offset + 2 * r + 1]
+            gaussian = torch.exp(-(xg_n ** 2 + yg_n ** 2) / (2 * sigma ** 2))
+            gaussian[gaussian < 1e-6] = 0
 
-            np.maximum(
+            r0, c0 = row_i[n].item(), col_i[n].item()
+            top    = max(0, r0 - r);  bottom = min(H, r0 + r + 1)
+            left   = max(0, c0 - r);  right  = min(W, c0 + r + 1)
+            g_top  = top  - (r0 - r); g_bottom = g_top + (bottom - top)
+            g_left = left - (c0 - r); g_right  = g_left + (right - left)
+
+            cls = gt_labels[n].item()
+            gt_heatmap[cls, top:bottom, left:right] = torch.maximum(
                 gt_heatmap[cls, top:bottom, left:right],
-                gaussian[g_top:g_bottom, g_left:g_right],
-                out=gt_heatmap[cls, top:bottom, left:right])
+                gaussian[g_top:g_bottom, g_left:g_right])
 
-        return torch.from_numpy(gt_heatmap).to(device)
+        return gt_heatmap

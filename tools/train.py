@@ -70,7 +70,7 @@ def parse_args():
         choices=['none', 'pytorch', 'slurm', 'mpi'],
         default='none',
         help='job launcher')
-    parser.add_argument('--local_rank', type=int, default=0)
+    parser.add_argument('--local-rank', '--local_rank', type=int, default=0)
     parser.add_argument(
         '--autoscale-lr',
         action='store_true',

@@ -5,3 +5,4 @@ data
 *.log
 *.pth
 runs
+prof_trace
