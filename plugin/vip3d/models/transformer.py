@@ -439,7 +439,7 @@ class TransFusionTransformerDecoder(BaseModule):
         inter_ref = []
         inter_size = []
 
-        # Layer 0: LiDAR BEV cross-attention 
+        # Layer 0: LiDAR BEV cross-attention
         q = query
         # self-attention
         q2, _ = self.sa0(q + query_pos, q + query_pos, q)
@@ -475,6 +475,10 @@ class TransFusionTransformerDecoder(BaseModule):
         mask = no_cam_mask.permute(1, 0).unsqueeze(-1)  # [num_q, B, 1]
         # take q_layer0 for queries with no valid camera view (mask=1), otherwise take q after SMCA cross-attn and FFN
         q = torch.where(mask, q_layer0, q)
+        from . import bev_vis as _bv
+        if _bv.DEBUG_PRINTS:
+            layer1_delta = (q - q_layer0).norm(dim=-1).mean().item()
+            print(f"[Decoder] no_cam_mask={mask.float().mean():.3f}  layer1_delta_norm={layer1_delta:.4f}  (>0.1=SMCA contributing)")
 
         if reg_branches is not None:
             reference_points, ref_size = self._update_ref(

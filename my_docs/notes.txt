@@ -1,16 +1,59 @@
-single feat from lower resolution FPN - strided are billinearly upsampled
-sine pos embeddings vs. learned pos. embeddings
-visualize the heatmap predictions agains ground truth
-Inference duplicate problem - fix: before top-K selection, zero out heatmap cells at the BEV grid locations of all active tracks. This costs almost nothing and guarantees the conflict never arises rather than relying on the model learning to suppress it.
+//add visualizations for top-k query in both BEV and camera to see the correctness of gaussian blobs
 
+OTAZKY KU 26.5. 2026
+1. Gradients diminishing?
+2. SCORE analysis
+python tools/score_analysis.py work_dirs/livip3d_resnet50_3cam/results_nusc.json
 
-ego vehicle vizualizacia co vidi + box - done
-EPA metrics
-projekcia GT bbox centrov na image planes - obmedzit na 3 kamery - done
-okomentovat kod a skontrolovat sanity (3 cam flow and masking, queries, loss computation)
+LIVIP3D 6 cam
+Overall:
+  TP: n=  694  mean=0.5169  median=0.4880  std=0.1241
+  FP: n= 6856  mean=0.5172  median=0.4800  std=0.1356
+  FP rate: 90.8%
+
+Per class:
+  car           TP= 386 (0.511)  FP=2606 (0.518)
+  truck         TP=  11 (0.529)  FP= 149 (0.497)
+  bus           TP=   9 (0.531)  FP= 211 (0.533)
+  trailer       TP=  30 (0.620)  FP= 212 (0.627)
+  motorcycle    TP=  10 (0.497)  FP= 152 (0.470)
+  bicycle       TP=   3 (0.551)  FP= 102 (0.544)
+  pedestrian    TP= 245 (0.513)  FP=3424 (0.511)
+
+VIP3D original 3 cam
+Overall:
+  TP: n=24459  mean=0.5902  median=0.5894  std=0.1233
+  FP: n=17408  mean=0.5042  median=0.4748  std=0.1160
+  FP rate: 41.6%
+
+Per class:
+  car           TP=15644 (0.598)  FP=11521 (0.500)
+  truck         TP=1687 (0.583)  FP=1963 (0.508)
+  bus           TP= 555 (0.680)  FP= 740 (0.539)
+  trailer       TP= 307 (0.565)  FP= 460 (0.507)
+  motorcycle    TP= 363 (0.542)  FP= 262 (0.478)
+  bicycle       TP= 330 (0.575)  FP= 108 (0.521)
+  pedestrian    TP=5573 (0.568)  FP=2354 (0.515)
+
+In TransFusion:
+Each frame is processed independently
+Output is top-K predictions ranked by score
+A real object doesn't need a score > 0.4 — it just needs to be ranked higher than FPs
+Even if TP mean=0.517 and FP mean=0.510, the TP still wins the ranking and gets detected
+In LiViP3D (tracking):
+A track must score > 0.4 to be confirmed
+Then it must score > 0.35 every single frame to survive
+With score std=0.134, any track will randomly dip below 0.35 roughly 17% of frames → track gets killed
+A real object needs to consistently score high across frame 0, 1, 2, 3... simultaneously
+So TransFusion's heatmap query init works because the classification head only needs to rank predictions, not calibrate a binary threshold. Your model's classification head also probably ranks TP slightly above FP — the problem is the absolute values are too close to the threshold and too noisy to survive multi-frame tracking.
+This also means the issue is not the query init architecture — it's the tracking score gate being a much harder requirement than detection ranking.
+The question is then: can the model learn stable enough scores to survive the tracking gate? The answer depends on training time + LR. By epoch 24 with cosine annealing pushing LR toward 2e-7, the model should be doing fine-grained calibration. It's worth evaluating epoch 24 before concluding the architecture is broken.
 
 
 COMMANDS
+# tensorboard
+tensorboard --logdir /home/cernanskyr/LiViP3D/runs/bev_vis --port 6007
+
 # crete .PKL
 python tools/data_converter/nusc_tracking.py
 # run the training 
@@ -25,7 +68,8 @@ CUDA_VISIBLE_DEVICES=1 bash tools/dist_train.sh plugin/vip3d/configs/livip3d_res
 bash tools/dist_train.sh plugin/vip3d/configs/livip3d_resnet50_3cam.py 2 --work-dir=work_dirs/livip3d_resnet50_3cam --resume-from work_dirs/livip3d_resnet50_3cam/latest.pth
 
 PYTHONPATH=. python tools/test.py   plugin/vip3d/configs/vip3d_resnet50_3cam.py   work_dirs/vip3d_resnet50_3cam/epoch_7.pth   --eval bbox   --out work_dirs/vip3d_resnet50_3cam/results.pkl
-python tools/prediction_eval.py   --result_path work_dirs/vip3d_resnet50_3cam/results_nusc.json   --prediction_infos_path nuscenes_prediction_infos_val.json
+CUDA_VISIBLE_DEVICES=0 PYTHONPATH=. python tools/test.py     plugin/vip3d/configs/livip3d_resnet50_3cam.py     work_dirs/livip3d_resnet50_3cam/epoch_13.pth     --eval bbox     --out work_dirs/livip3d_resnet50_3cam/results_ep13.pkl
+python tools/prediction_eval.py   --result_path work_dirs/lip3d_resnet50_3cam/results_nusc.json   --prediction_infos_path nuscenes_prediction_infos_val.json
 # with filtering 
 python tools/prediction_eval.py   --result_path work_dirs/vip3d_resnet50_3cam/results_nusc.json   --prediction_infos_path nuscenes_prediction_infos_val.json   --nusc_dataroot /mnt/hdd/cernanskyr/nuscenes    --nusc_version v1.0-trainval
 # visualize predictions
@@ -50,6 +94,18 @@ is dropping offsets really that unhelpful?
 if the queries are chosen from the pixels in the heatmap positive reqion, what is the chance for a ref_point to go often outside 
 focal for the whole map
 the 3cam visible space?
+
+single feat from lower resolution FPN - strided are billinearly upsampled
+sine pos embeddings vs. learned pos. embeddings
+visualize the heatmap predictions agains ground truth
+Inference duplicate problem - fix: before top-K selection, zero out heatmap cells at the BEV grid locations of all active tracks. This costs almost nothing and guarantees the conflict never arises rather than relying on the model learning to suppress it.
+
+ego vehicle vizualizacia co vidi + box - done
+EPA metrics
+projekcia GT bbox centrov na image planes - obmedzit na 3 kamery - done
+okomentovat kod a skontrolovat sanity (3 cam flow and masking, queries, loss computation)
+
+
 
 TODO:
 visualize predictions on baseline - evaluate

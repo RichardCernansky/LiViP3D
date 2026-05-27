@@ -95,6 +95,7 @@ class ViP3D(MVXTwoStageDetector):
                 lidar_bev_channels=256,
                 lidar_voxel_size=None,
                 lidar_out_size_factor=4,
+                heatmap_score_thresh=0.1,
                 # END NEW
                  bbox_coder=None,
                  qim_args=None,
@@ -128,6 +129,9 @@ class ViP3D(MVXTwoStageDetector):
                  only_matched_query=False,
                  add_branch=False,
                  add_branch_2=False,
+                 debug=False,
+                 bev_vis=True,
+                 vis_interval=20,
                  ):
         super(ViP3D,
               self).__init__(pts_voxel_layer, pts_voxel_encoder,
@@ -135,6 +139,11 @@ class ViP3D(MVXTwoStageDetector):
                              img_backbone, pts_backbone, img_neck, pts_neck,
                              pts_bbox_head, img_roi_head, img_rpn_head,
                              train_cfg, test_cfg, pretrained)
+        import plugin.vip3d.models.bev_vis as _bv_mod
+        _bv_mod.ENABLED      = bev_vis
+        _bv_mod.DEBUG_PRINTS = debug
+        _bv_mod.VIS_INTERVAL = vis_interval
+
         self.grid_mask = GridMask(True, True, rotate=1, offset=False, ratio=0.5, mode=1, prob=0.7)
         self.use_grid_mask = use_grid_mask
         self.num_classes = num_classes
@@ -150,6 +159,7 @@ class ViP3D(MVXTwoStageDetector):
         self.bbox_size_fc = nn.Linear(self.embed_dims, 3)
 
         self.use_lidar = use_lidar
+        self.heatmap_score_thresh = heatmap_score_thresh
         if fix_lidar and self.use_lidar:
             for m in [self.pts_voxel_encoder, self.pts_middle_encoder,
                       self.pts_backbone, self.pts_neck]:
@@ -275,7 +285,6 @@ class ViP3D(MVXTwoStageDetector):
         # fix — rotation matrix: inv(R).T = R:
         ref_pts = (ref_pts - l2g_t2) @ l2g_r2.type(torch.float)
         # ref_pts = (ref_pts - l2g_t2) @ torch.linalg.inv(l2g_r2).T.type(torch.float)
-
 
         ref_pts[..., 0:1] = (ref_pts[..., 0:1] - pc_range[0]) / (pc_range[3] - pc_range[0])
         ref_pts[..., 1:2] = (ref_pts[..., 1:2] - pc_range[1]) / (pc_range[4] - pc_range[1])
@@ -509,13 +518,19 @@ class ViP3D(MVXTwoStageDetector):
             if num_empty > 0:
                 active_ref = track_instances.ref_pts[track_instances.obj_idxes >= 0] \
                             if (track_instances.obj_idxes >= 0).any() else None
-                new_ref_pts, new_queries = self.select_topk_from_heatmap(
+                new_ref_pts, new_queries, _ = self.select_topk_from_heatmap(
                     heatmap, bev_feat, num_select=num_empty, active_ref_pts=active_ref, img_metas=img_metas)
 
                 track_instances.ref_pts = track_instances.ref_pts.clone()
                 track_instances.query   = track_instances.query.clone()
                 track_instances.ref_pts[empty_mask] = new_ref_pts
                 track_instances.query[empty_mask]   = new_queries
+
+                # store top-20 for SMCA visualisation
+                from .bev_vis import set_top_queries as _set_tq
+                empty_indices = empty_mask.nonzero(as_tuple=False)[:, 0]
+                top20_idx = empty_indices[:20]
+                _set_tq(track_instances.ref_pts[top20_idx], top20_idx)
 
             # 2. heatmap supervision — independent of whether any slots were filled
             gt_hm_vis = None
@@ -550,7 +565,7 @@ class ViP3D(MVXTwoStageDetector):
                 frame_idx = self.criterion._current_frame_idx
                 self.criterion.losses_dict[f'frame_{frame_idx}_heatmap_loss'] = heatmap_loss
 
-            # visualize_bev(bev_feat, heatmap, gt_hm_vis)
+            visualize_bev(bev_feat, heatmap, gt_hm_vis)
         # LiVip add end
 
         # always runs regardless of use_lidar
@@ -560,6 +575,11 @@ class ViP3D(MVXTwoStageDetector):
             track_instances.ref_pts, ref_box_sizes, img_metas,
             bev_feat=bev_feat if (self.use_lidar and pts_feats is not None) else None)
 
+        # SMCA attention visualisation (runs after pts_bbox_head so attn is collected)
+        if self.use_lidar and pts_feats is not None:
+            from .bev_vis import visualize_train_smca as _vis_smca, visualize_smca_gauss as _vis_gauss
+            _vis_smca(heatmap, img)
+            _vis_gauss(img)
 
         if self.add_branch:
             self.update_history_img_list(img_metas, img, img_feats)
@@ -909,29 +929,60 @@ class ViP3D(MVXTwoStageDetector):
                  track_instances.pred_boxes[:, 5:6]], dim=1)
 
             # ── LiViP3D: fill empty query slots from LiDAR heatmap ──────────────────
+            bev_feat = None
             if self.use_lidar and pts_feats is not None:
                 bev_feat = pts_feats[0] if isinstance(pts_feats, (list, tuple)) else pts_feats
-                heatmap  = self.heatmap_head(bev_feat)
+                shared   = self.heatmap_head(bev_feat)
+                _t2 = self.hm_task2(shared); _t4 = self.hm_task4(shared); _t5 = self.hm_task5(shared)
+                heatmap  = torch.cat([
+                    self.hm_task0(shared),
+                    self.hm_task1(shared)[:, :1],
+                    _t2[:, :1], _t2[:, 1:],
+                    _t4[:, :1], _t4[:, 1:],
+                    _t5[:, :1],
+                ], dim=1)
                 empty_mask = track_instances.obj_idxes < 0
                 num_empty  = int(empty_mask.sum())
                 if num_empty > 0:
                     active_ref = track_instances.ref_pts[track_instances.obj_idxes >= 0] \
                                 if (track_instances.obj_idxes >= 0).any() else None
-                    new_ref_pts, new_queries = self.select_topk_from_heatmap(
+                    new_ref_pts, new_queries, hm_scores = self.select_topk_from_heatmap(
                         heatmap, bev_feat, num_select=num_empty, active_ref_pts=active_ref, img_metas=img_metas)
 
-                    track_instances.ref_pts = track_instances.ref_pts.clone()
-                    track_instances.query   = track_instances.query.clone()
-                    track_instances.ref_pts[empty_mask] = new_ref_pts
-                    track_instances.query[empty_mask]   = new_queries
+                    # Always fill all empty slots with heatmap positions so ref_pts are
+                    # spread across the BEV rather than sitting at zero (vehicle origin).
+                    # Track birth is still gated by TrackBase.update's score_thresh=0.4,
+                    # so low-confidence peaks won't birth tracks even though they get positions.
+                    n_fill = new_ref_pts.shape[0]
+                    if n_fill > 0:
+                        empty_indices = empty_mask.nonzero(as_tuple=False)[:, 0][:n_fill]
+                        track_instances.ref_pts = track_instances.ref_pts.clone()
+                        track_instances.query   = track_instances.query.clone()
+                        track_instances.ref_pts[empty_indices] = new_ref_pts
+                        track_instances.query[empty_indices]   = new_queries
 
             # ── end LiViP3D ──────────────────────────────────────────────────────────
 
+            # ── Pass heatmap + GT to BEV visualiser ──────────────────────────
+            from .bev_vis import set_gt_bev as _set_gt, set_heatmap as _set_hm
+            _set_hm(heatmap if self.use_lidar and pts_feats is not None else None)
+            if gt_bboxes_3d is not None:
+                import numpy as np
+                boxes = gt_bboxes_3d[0].tensor if hasattr(gt_bboxes_3d[0], 'tensor') \
+                        else gt_bboxes_3d[0]        # [N, >=3] metric: x,y,z,...
+                pc = self.pc_range
+                x_n = ((boxes[:, 0].cpu().numpy() - pc[0]) / (pc[3] - pc[0])).clip(0, 1)
+                y_n = ((boxes[:, 1].cpu().numpy() - pc[1]) / (pc[4] - pc[1])).clip(0, 1)
+                _set_gt(np.stack([x_n, y_n], axis=1))
+            else:
+                _set_gt(None)
+            # ─────────────────────────────────────────────────────────────────
 
             output_classes, output_coords, \
                 query_feats, last_ref_pts = self.pts_bbox_head(
                 img_feats, radar_feats, track_instances.query,
-                track_instances.ref_pts, ref_box_sizes, img_metas, )
+                track_instances.ref_pts, ref_box_sizes, img_metas,
+                bev_feat=bev_feat)
 
         if self.add_branch:
             self.update_history_img_list(img_metas, img, img_feats)
@@ -943,6 +994,17 @@ class ViP3D(MVXTwoStageDetector):
         # TODO: Why no max?
         track_scores = output_classes[-1, 0, :].sigmoid().max(dim=-1).values
         # track_scores = output_classes[-1, 0, :, 0].sigmoid()
+
+        # Blend decoder score with heatmap confidence at each track's position.
+        # TP tracks sit on strong heatmap peaks → blended score rises above 0.5 → persist.
+        # FP tracks sit on noise → blended score drops below filter_score_thresh → die quickly.
+        # if bev_feat is not None:
+        #     ref_norm = last_ref_pts[0].sigmoid()                        # [N, 3] in [0,1]
+        #     H, W = heatmap.shape[2], heatmap.shape[3]
+        #     col = (ref_norm[:, 0] * W).long().clamp(0, W - 1)
+        #     row = (ref_norm[:, 1] * H).long().clamp(0, H - 1)
+        #     hm_at_track = heatmap[0].sigmoid()[:, row, col].max(dim=0).values  # [N]
+        #     track_scores = 0.5 * track_scores + 0.5 * hm_at_track
 
         # Step-1 Update track instances with current prediction
         # [nb_dec, bs, num_query, xxx]
@@ -1083,7 +1145,7 @@ class ViP3D(MVXTwoStageDetector):
 
         if mapping is not None:
             mapping = mapping[0]
-
+        
         if self.do_pred and results[0] is not None and mapping['valid_pred'] \
                 and (len(results[0]['track_ids']) > 0 and len(instance_idx_2_labels[0]) > 0):
             # only predict agent appeared at current index
@@ -1238,45 +1300,6 @@ class ViP3D(MVXTwoStageDetector):
         )
 
         return [result_dict]
-
-    # PROFILING
-    # def train_step(self, data, optimizer):
-    #         # ── one-shot profiler ──────────────────────────────────────────────
-    #         if not hasattr(self, '_prof_counter'):
-    #             self._prof_counter = 0
-    #             self._prof = torch.profiler.profile(
-    #                 activities=[
-    #                     torch.profiler.ProfilerActivity.CPU,
-    #                     torch.profiler.ProfilerActivity.CUDA,
-    #                 ],
-    #                 schedule=torch.profiler.schedule(wait=1, warmup=1, active=3, repeat=1),
-    #                 on_trace_ready=torch.profiler.tensorboard_trace_handler('./prof_trace'),
-    #                 record_shapes=True,
-    #                 with_stack=False,        # set True if you want line numbers (slower)
-    #                 profile_memory=False,
-    #             )
-    #             self._prof.__enter__()
-
-    #         losses, others_dict = self(**data)
-    #         loss, log_vars = self._parse_losses(losses)
-
-    #         self._prof.step()
-    #         self._prof_counter += 1
-            
-    #         if self._prof_counter == 5:      # wait(1) + warmup(1) + active(3)
-    #             self._prof.__exit__(None, None, None)
-                
-    #             # 1. Print the CPU-sorted table to the console
-    #             print(self._prof.key_averages(group_by_stack_n=5).table(
-    #                 sort_by="self_cpu_time_total", row_limit=30))
-                
-    #             import sys; sys.exit(0)
-    #         # ───────────────────────────────────────────────────────────────────
-
-    #         outputs = dict(
-    #             loss=loss, log_vars=log_vars, num_samples=len(data['img_metas']))
-    #         outputs.update(others_dict)
-    #         return outputs
 
     def train_step(self, data, optimizer):
         # Core model logic remains
@@ -1450,7 +1473,7 @@ class ViP3D(MVXTwoStageDetector):
         queries = torch.cat([content, content], dim=-1)     # [B, ns, embed_dims*2]
 
         # Return for batch 0 (BS=1 assumption same as rest of ViP3D)
-        return ref_pts[0], queries[0]                       # [ns, 3], [ns, embed_dims*2]
+        return ref_pts[0], queries[0], topk_scores[0]       # [ns, 3], [ns, embed_dims*2], [ns]
 
     def _generate_gt_heatmap(self, gt_boxes, gt_labels, H, W, device):
         """

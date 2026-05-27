@@ -162,6 +162,9 @@ model = dict(
             normalize=True,
             offset=-0.5),
     ),
+    debug=False,
+    bev_vis=False,
+    vis_interval=20,
     do_pred=True,
     relative_pred=True,
     agents_layer_0=True,
@@ -238,14 +241,24 @@ test_pipeline = [
         load_dim=5,
         use_dim=5,
         file_client_args=file_client_args),
+    dict(
+        type='LoadPointsFromMultiSweeps',
+        load_dim=5,
+        sweeps_num=10,
+        use_dim=[0, 1, 2, 3, 4],
+        file_client_args=file_client_args,
+        pad_empty_sweeps=True,
+        remove_close=True),
     dict(type='LoadMultiViewImageFromFiles'),
     dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),  # for BEV vis debug
     dict(type='NormalizeMultiviewImage', **img_norm_cfg),
     dict(type='PadMultiViewImage', size_divisor=32),
 ]
 test_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
+        'gt_bboxes_3d', 'gt_labels_3d',  # for BEV vis debug
         'points', 'img', 'timestamp', 'l2g_r_mat', 'l2g_t',
         'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]

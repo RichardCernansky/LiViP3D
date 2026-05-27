@@ -12,4 +12,4 @@ from .head_plus_raw import DeformableDETR3DCamHeadTrackPlusRaw, TransFusionDetHe
 from .vip3d import ViP3D
 
 from .attention_dert3d import (Detr3DCrossAtten, Detr3DCamRadarCrossAtten,
-                                LiDARBEVCrossAtten, SMCACrossAtten)
+                                SMCACrossAtten, LiDARBEVDeformCrossAtten)
