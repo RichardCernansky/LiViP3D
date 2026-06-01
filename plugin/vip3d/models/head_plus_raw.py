@@ -164,8 +164,7 @@ class DeformableDETR3DCamHeadTrackPlusRaw(nn.Module):
             last_ref_points (Tensor): shape [bs, num_query, 3]
         """
 
-        if True:
-            # TODO: add postional encoding here to multilevel feats
+        if mlvl_feats is not None:  # skipped for lidar-only (no camera features)
             batch_size = mlvl_feats[0].size(0)
             input_img_h, input_img_w = img_metas[0]['input_shape']
             img_masks = mlvl_feats[0].new_ones(
@@ -271,27 +270,28 @@ class TransFusionDetHead(DeformableDETR3DCamHeadTrackPlusRaw):
     def forward(self, mlvl_feats, radar_feats, query_embeds, ref_points,
                 ref_size, img_metas, bev_feat=None, petr_feature=False):
         
-        # positional encoding on multi-level image features (same as parent)
-        batch_size = mlvl_feats[0].size(0)
-        input_img_h, input_img_w = img_metas[0]['input_shape']
-        img_masks = mlvl_feats[0].new_ones(
-            (batch_size, input_img_h, input_img_w))
-        for img_id in range(batch_size):
-            img_h, img_w, _ = img_metas[img_id]['img_shape'][0][0]
-            img_masks[img_id, :img_h, :img_w] = 0
+        # positional encoding on multi-level image features (skipped for lidar-only)
+        if mlvl_feats is not None:
+            batch_size = mlvl_feats[0].size(0)
+            input_img_h, input_img_w = img_metas[0]['input_shape']
+            img_masks = mlvl_feats[0].new_ones(
+                (batch_size, input_img_h, input_img_w))
+            for img_id in range(batch_size):
+                img_h, img_w, _ = img_metas[img_id]['img_shape'][0][0]
+                img_masks[img_id, :img_h, :img_w] = 0
 
-        for i, feat in enumerate(mlvl_feats):
-            B, N, C, H, W = feat.size()
-            mlvl_masks = F.interpolate(
-                img_masks[None], size=feat.shape[-2:]).to(torch.bool).squeeze(0)
-            pos_enc = self.positional_encoding(mlvl_masks)
-            pos_enc = pos_enc.unsqueeze(1).repeat(1, N, 1, 1, 1)
-            # LiVpi Note: do not add lvl_embedding -> FPN features are fused
-            lvl_enc = self.level_embeds[i].view(1, 1, -1, 1, 1)
-            cam_enc = self.cam_embeds.view(1, N, C, 1, 1)
-            # add positional encoding, camera embedding together
-            pos_enc = pos_enc + cam_enc + lvl_enc
-            mlvl_feats[i] = feat + pos_enc
+            for i, feat in enumerate(mlvl_feats):
+                B, N, C, H, W = feat.size()
+                mlvl_masks = F.interpolate(
+                    img_masks[None], size=feat.shape[-2:]).to(torch.bool).squeeze(0)
+                pos_enc = self.positional_encoding(mlvl_masks)
+                pos_enc = pos_enc.unsqueeze(1).repeat(1, N, 1, 1, 1)
+                # LiVpi Note: do not add lvl_embedding -> FPN features are fused
+                lvl_enc = self.level_embeds[i].view(1, 1, -1, 1, 1)
+                cam_enc = self.cam_embeds.view(1, N, C, 1, 1)
+                # add positional encoding, camera embedding together
+                pos_enc = pos_enc + cam_enc + lvl_enc
+                mlvl_feats[i] = feat + pos_enc
 
         # 2-layer TransFusion decoder
         hs, inter_references, inter_box_sizes = self.transformer(

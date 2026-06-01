@@ -433,6 +433,9 @@ class Detr3DCamRadarCrossAtten(BaseModule):
 
 
 def feature_sampling(mlvl_feats, reference_points, pc_range, img_metas):
+    if not img_metas or 'lidar2img' not in img_metas[0]:
+        # lidar-only: caller (add_branch_update_query) should skip before reaching here
+        raise RuntimeError("feature_sampling called without 'lidar2img'; guard the call site")
     lidar2img = []
     for img_meta in img_metas:
         lidar2img.append(img_meta['lidar2img'])
@@ -838,6 +841,9 @@ class SMCACrossAtten(BaseModule):
             valid:  [B, num_q, num_cams]  bool
             ref_3d: [B, num_q, 3]         3D coords in metric space
         """
+        if not img_metas or 'lidar2img' not in img_metas[0]:
+            # unreachable with use_camera=False, but guard defensively
+            raise RuntimeError("_project_points requires 'lidar2img'; called in lidar-only mode?")
         lidar2img = []
         for meta in img_metas:
             lidar2img.append(meta['lidar2img'])
@@ -889,6 +895,7 @@ class SMCACrossAtten(BaseModule):
 
         pc = self.pc_range
         ref = reference_points.clone()
+        # denormalize to metric space
         ref[..., 0] = ref[..., 0] * (pc[3] - pc[0]) + pc[0]
         ref[..., 1] = ref[..., 1] * (pc[4] - pc[1]) + pc[1]
         ref[..., 2] = ref[..., 2] * (pc[5] - pc[2]) + pc[2]
@@ -901,7 +908,7 @@ class SMCACrossAtten(BaseModule):
         hl = wl[..., 1:2] / 2             # half-length
         z  = torch.zeros_like(hw)
 
-        # 5 points: center + 4 axis-aligned half-extents [B, num_q, 5, 4]
+        # 5 points: center + 4 axis-aligned half-extents [B, num_q, 5, 4] per query (representing the vehicle box)
         pts = torch.cat([
             torch.cat([ref,                                    torch.ones_like(ref[..., :1])], -1).unsqueeze(2),
             torch.cat([ref + torch.cat([ hw, z, z], -1),      torch.ones_like(ref[..., :1])], -1).unsqueeze(2),
@@ -913,35 +920,27 @@ class SMCACrossAtten(BaseModule):
         # project into each camera
         pts_e = pts.view(B, 1, num_q, 5, 4, 1).expand(-1, num_cams, -1, -1, -1, -1)
         l2i   = lidar2img.view(B, num_cams, 1, 1, 4, 4).expand(-1, -1, num_q, 5, -1, -1)
+        # % points in camera space for each query
         pts_cam = torch.matmul(l2i, pts_e).squeeze(-1)  # [B, num_cams, num_q, 5, 4]
 
-        # ── OLD (broken) sigma — behind-camera corners inflate sigma to 4M ──────
-        # depth = pts_cam[..., 2].clamp(min=1e-5)
-        # u = pts_cam[..., 0] / depth  # [B, num_cams, num_q, 5] in pixels
-        # v = pts_cam[..., 1] / depth
-        # img_h = img_metas[0]['img_shape'][0][0][0]
-        # img_w = img_metas[0]['img_shape'][0][0][1]
-        # u_feat = u / img_w * W_feat  # [B, num_cams, num_q, 5]
-        # v_feat = v / img_h * H_feat
-        # u_range = u_feat.amax(dim=-1) - u_feat.amin(dim=-1)  # [B, num_cams, num_q]
-        # v_range = v_feat.amax(dim=-1) - v_feat.amin(dim=-1)
-        # radius = torch.ceil(torch.stack([u_range, v_range], dim=-1).norm(p=2, dim=-1) / 2)
-        # sigma  = (radius * 2 + 1) / 6.0
-        # sigma  = sigma.clamp(min=1.0)  # at least 1 feature pixel
-
         # ── NEW (fixed) sigma — front-mask only, clamp max=50 ───────────────
-        front = pts_cam[..., 2] > 0                           # [B, num_cams, num_q, 5]
+        front = pts_cam[..., 2] > 0     # bit mask for front                           # [B, num_cams, num_q, 5]
         depth = pts_cam[..., 2].clamp(min=1e-5)
+
+        # u,v corner coords in pixel space    # bit mask for front 
         u = pts_cam[..., 0] / depth                           # [B, num_cams, num_q, 5]
         v = pts_cam[..., 1] / depth
         img_h = img_metas[0]['img_shape'][0][0][0]
         img_w = img_metas[0]['img_shape'][0][0][1]
         u_feat = u / img_w * W_feat
         v_feat = v / img_h * H_feat
+
         # only use corners in front of the camera; behind-camera corners divided
         # by clamped near-zero depth produce millions-of-pixels coordinates
         INF = 1e6
-        u_for_max = torch.where(front, u_feat, torch.full_like(u_feat, -INF))
+
+        # set easily beaten default min/max values (for not front) so only front corners contribute to the range
+        u_for_max = torch.where(front, u_feat, torch.full_like(u_feat, -INF)) # torch.where(bit_mask, value_if_true, value_if_false)
         u_for_min = torch.where(front, u_feat, torch.full_like(u_feat,  INF))
         v_for_max = torch.where(front, v_feat, torch.full_like(v_feat, -INF))
         v_for_min = torch.where(front, v_feat, torch.full_like(v_feat,  INF))
@@ -1091,4 +1090,6 @@ class SMCACrossAtten(BaseModule):
         if _bv.DEBUG_PRINTS:
             print(f"[SMCA] no_cam_mask_rate={no_cam_mask.float().mean():.3f}  (0=all visible, 1=none)")
         return self.dropout(out) + inp_residual + pos_feat, no_cam_mask
+
+
 

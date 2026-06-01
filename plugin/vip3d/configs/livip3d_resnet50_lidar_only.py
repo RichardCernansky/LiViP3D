@@ -19,7 +19,7 @@ class_names = [
 
 input_modality = dict(
     use_lidar=True,
-    use_camera=True,
+    use_camera=False,
     use_radar=False,
     use_map=False,
     use_external=False)
@@ -35,7 +35,7 @@ model = dict(
         pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
         max_num=100,
         num_classes=7),
-    fix_feats=False,
+    fix_feats=True,   # frozen — no camera gradients, saves ~4GB activation memory
     fix_lidar=False,
     score_thresh=0.4,
     filter_score_thresh=0.35,
@@ -138,7 +138,7 @@ model = dict(
                 num_heads=8,
                 ffn_dims=512,
                 dropout=0.1,
-                use_camera=True,
+                use_camera=False,
                 lidar_bev_attn=dict(
                     type='LiDARBEVDeformCrossAtten',
                     embed_dims=256,
@@ -164,7 +164,7 @@ model = dict(
             offset=-0.5),
     ),
     debug=False,
-    bev_vis=False,
+    bev_vis=True,
     vis_interval=20,
     do_pred=True,
     relative_pred=True,
@@ -198,7 +198,6 @@ model = dict(
                 pc_range=point_cloud_range)
         )
     ),
-
 )
 
 dataset_type = 'NuScenesTrackDatasetRadar'
@@ -220,17 +219,13 @@ train_pipeline = [
         file_client_args=file_client_args,
         pad_empty_sweeps=True,
         remove_close=True),
-    dict(type='LoadMultiViewImageFromFiles'),
-    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
     dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
     dict(type='InstanceRangeFilter', point_cloud_range=point_cloud_range),
-    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-    dict(type='PadMultiViewImage', size_divisor=32),
 ]
 train_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
-        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds', 'img',
+        'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds',
         'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
         'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
@@ -250,17 +245,13 @@ test_pipeline = [
         file_client_args=file_client_args,
         pad_empty_sweeps=True,
         remove_close=True),
-    dict(type='LoadMultiViewImageFromFiles'),
-    dict(type='ResizeMultiViewKeepRatio', scale=(960, 544), keep_ratio=True),
-    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),  # for BEV vis debug
-    dict(type='NormalizeMultiviewImage', **img_norm_cfg),
-    dict(type='PadMultiViewImage', size_divisor=32),
+    dict(type='LoadAnnotations3D', with_bbox_3d=True, with_label_3d=True),
 ]
 test_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
-        'gt_bboxes_3d', 'gt_labels_3d',  # for BEV vis debug
-        'points', 'img', 'timestamp', 'l2g_r_mat', 'l2g_t',
+        'gt_bboxes_3d', 'gt_labels_3d',
+        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
         'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
 ]
 
@@ -307,11 +298,12 @@ optimizer = dict(
     lr=2e-4,
     paramwise_cfg=dict(
         custom_keys={
-            'img_backbone': dict(lr_mult=0.1),
+            'img_backbone': dict(lr_mult=0.0),  # frozen, no update needed
+            'img_neck':     dict(lr_mult=0.0),  # frozen
             'pts_backbone': dict(lr_mult=0.1),
             'pts_neck':     dict(lr_mult=0.1),
-            'heatmap_head': dict(lr_mult=0.1),  # pretrained shared_conv
-            'hm_task0':    dict(lr_mult=0.1),  # pretrained CenterPoint task heads
+            'heatmap_head': dict(lr_mult=0.1),
+            'hm_task0':    dict(lr_mult=0.1),
             'hm_task1':    dict(lr_mult=0.1),
             'hm_task2':    dict(lr_mult=0.1),
             'hm_task4':    dict(lr_mult=0.1),
@@ -326,9 +318,9 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
-total_epochs = 24
-evaluation = dict(interval=24)
-runner = dict(type='EpochBasedRunner', max_epochs=24)
+total_epochs = 40 
+evaluation = dict(interval=40)
+runner = dict(type='EpochBasedRunner', max_epochs=40)
 
 find_unused_parameters = True
 load_from = 'ckpt_init/livip3d_init.pth'

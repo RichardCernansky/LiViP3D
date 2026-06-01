@@ -310,8 +310,8 @@ class ViP3D(MVXTwoStageDetector):
 
     def extract_img_feat(self, img, img_metas):
         """Extract features of images."""
-        B = img.size(0)
         if self.with_img_backbone and img is not None:
+            B = img.size(0)
             input_shape = img.shape[-2:]
             # update real input shape of each single img
             for img_meta in img_metas:
@@ -480,7 +480,8 @@ class ViP3D(MVXTwoStageDetector):
         '''
         # l2g_r2 is rotation matrix of next frame
 
-        B, num_cam, _, H, W = img.shape
+        if img is not None:  # lidar-only: img is None, B/num_cam/H/W unused
+            B, num_cam, _, H, W = img.shape
 
         if not hasattr(self, '_heatmap_verified'):
             self._heatmap_verified = True
@@ -679,8 +680,14 @@ class ViP3D(MVXTwoStageDetector):
 
         timestamp = timestamp
 
-        bs = img.size(0)
-        num_frame = img.size(1)
+        bs = len(gt_bboxes_3d)          # batch size (always 1)
+        num_frame = l2g_r_mat.size(0)   # T frames in this clip
+        _device = l2g_r_mat.device      # use lidar pose tensor as device ref — img may be None
+        # project GT to check camera visibility only when using a partial camera rig
+        # (< 6 cams → no 360° coverage); with 6 cams or lidar-only all objects are visible
+        check_cam_vis = (img is not None) and (self.pts_bbox_head.num_cams < 6)
+        if check_cam_vis:
+            img_h, img_w = img.shape[-2], img.shape[-1]
         track_instances = self._generate_empty_tracks()
 
         # init gt instances!
@@ -688,26 +695,26 @@ class ViP3D(MVXTwoStageDetector):
         # Compute per-instance camera visibility once, store as vis_mask.
         # All GT boxes stay in the count (keeps num_samples stable → stable loss
         # normalisation), but loss_labels and loss_boxes will zero out invisible ones.
-        lidar2img_gt = img_metas[0]['lidar2img']  # list[T] of [num_cam, 4, 4]
-        img_h, img_w = img.shape[-2], img.shape[-1]
         gt_instances_list = []
         for i in range(num_frame):
             gt_instances = Instances((1, 1))
-            boxes = gt_bboxes_3d[0][i].tensor.to(img.device)
+            boxes = gt_bboxes_3d[0][i].tensor.to(_device)
 
-            # if len(boxes) > 0:
-            #     centers = boxes[:, :3]
-            #     pts_h = torch.cat([centers, torch.ones(len(centers), 1, device=img.device)], dim=1)
-            #     l2i = torch.tensor(np.array(lidar2img_gt[i]), dtype=torch.float32, device=img.device)
-            #     pts_cam = torch.einsum('cij,nj->nci', l2i, pts_h)  # [N, num_cam, 4]
-            #     depth = pts_cam[..., 2]
-            #     u = pts_cam[..., 0] / depth.clamp(min=1e-5)
-            #     v = pts_cam[..., 1] / depth.clamp(min=1e-5)
-            #     visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
-            #     vis_mask = visible.any(dim=1)  # [N] True = visible in at least one camera
-            # else:
-            #     vis_mask = torch.zeros(0, dtype=torch.bool, device=img.device)
-            vis_mask = torch.ones(len(boxes), dtype=torch.bool, device=img.device)
+            if check_cam_vis and len(boxes) > 0:
+                lidar2img_gt = img_metas[0]['lidar2img']  # list[T] of [num_cam, 4, 4]
+                centers = boxes[:, :3]
+                pts_h = torch.cat([centers, torch.ones(len(centers), 1, device=_device)], dim=1)
+                l2i = torch.tensor(np.array(lidar2img_gt[i]), dtype=torch.float32, device=_device)
+                pts_cam = torch.einsum('cij,nj->nci', l2i, pts_h)  # [N, num_cam, 4]
+                depth = pts_cam[..., 2]
+                u = pts_cam[..., 0] / depth.clamp(min=1e-5)
+                v = pts_cam[..., 1] / depth.clamp(min=1e-5)
+                visible = (depth > 0) & (u > 0) & (u < img_w) & (v > 0) & (v < img_h)
+                vis_mask = visible.any(dim=1)  # [N] True = visible in at least one camera
+            elif check_cam_vis:
+                vis_mask = torch.zeros(0, dtype=torch.bool, device=_device)
+            else:
+                vis_mask = torch.ones(len(boxes), dtype=torch.bool, device=_device)
 
             boxes = normalize_bbox(boxes, self.pc_range)
             gt_instances.boxes = boxes
@@ -732,15 +739,16 @@ class ViP3D(MVXTwoStageDetector):
 
         if True:
             # for bs 1
-            lidar2img = img_metas[0]['lidar2img']  # [T, num_cam]
+            lidar2img = img_metas[0]['lidar2img'] if img is not None else None  # [T, num_cam]; None for lidar-only
             for i in range(num_frame):
                 points_single = [p_[i] for p_ in points] if points is not None else None
 
-                img_single = torch.stack([img_[i] for img_ in img], dim=0)
-                radar_single = torch.stack([radar_[i] for radar_ in radar], dim=0) if radar is not None else None 
+                img_single = torch.stack([img_[i] for img_ in img], dim=0) if img is not None else None  # None for lidar-only
+                radar_single = torch.stack([radar_[i] for radar_ in radar], dim=0) if radar is not None else None
 
                 img_metas_single = deepcopy(img_metas)
-                img_metas_single[0]['lidar2img'] = lidar2img[i]
+                if lidar2img is not None:  # only set per-frame lidar2img when camera is active
+                    img_metas_single[0]['lidar2img'] = lidar2img[i]
 
                 if i == num_frame - 1:
                     l2g_r2 = None
@@ -908,19 +916,13 @@ class ViP3D(MVXTwoStageDetector):
             active_inst.ref_pts = ref_pts
         track_instances = Instances.cat([other_inst, active_inst])
 
-        try:
+        if img is not None:  # lidar-only: img is None
             B, num_cam, _, H, W = img.shape
-        except Exception:
-            assert False
-        B, num_cam, _, H, W = img.shape
 
-        """
-        # what does it do? img_feats = [a.clone() for a in img_feats]
-        """
         if True:
             img_feats, radar_feats, pts_feats = self.extract_feat(
                 points, img=img, radar=radar, img_metas=img_metas)
-            img_feats = [a.clone() for a in img_feats]
+            img_feats = [a.clone() for a in img_feats] if img_feats is not None else None  # None for lidar-only
 
             # output_classes: [num_dec, B, num_query, num_classes]
             # query_feats: [B, num_query, embed_dim]
@@ -1073,11 +1075,11 @@ class ViP3D(MVXTwoStageDetector):
         # change to [1, 3]
         l2g_t = l2g_t[0].unsqueeze(dim=1)[0]
 
-        bs = img.size(0)
-        num_frame = img.size(1)
+        bs = len(img_metas)                      # always 1 at test time
+        num_frame = len(img_metas[0]['lidar2img']) if 'lidar2img' in img_metas[0] else len(points[0])  # lidar-only: no lidar2img
 
         timestamp = timestamp[0]
-        device = img.device
+        device = l2g_r_mat.device  # img may be None; derive device from pose tensor
 
         # track_instances of last frame
         if self.test_track_instances is None:
@@ -1115,14 +1117,15 @@ class ViP3D(MVXTwoStageDetector):
         self.l2g_t = l2g_t
 
         # for bs 1;
-        lidar2img = img_metas[0]['lidar2img']  # [T, num_cam]
+        lidar2img = img_metas[0].get('lidar2img')  # None for lidar-only
         for i in range(num_frame):
             points_single = [p_[i] for p_ in points] if points is not None else None
-            img_single = torch.stack([img_[i] for img_ in img], dim=0)
+            img_single = torch.stack([img_[i] for img_ in img], dim=0) if img is not None else None  # None for lidar-only
             radar_single = torch.stack([radar_[i] for radar_ in radar], dim=0) if radar is not None else None
 
             img_metas_single = deepcopy(img_metas)
-            img_metas_single[0]['lidar2img'] = lidar2img[i]
+            if lidar2img is not None:  # only set for camera mode
+                img_metas_single[0]['lidar2img'] = lidar2img[i]
 
             track_instances = self._inference_single(points_single, img_single,
                                                      radar_single,
@@ -1342,12 +1345,13 @@ class ViP3D(MVXTwoStageDetector):
         reference_points = torch.tensor(reference_points, dtype=torch.float, device=device)
 
         query = self.add_branch_mlp(output_embedding)
-        query = self.add_branch_attention(query=query.unsqueeze(1),
-                                          reference_points=reference_points.unsqueeze(0),
-                                          value=self.history_img_feats[-1],
-                                          img_metas=self.history_img_metas[-1])
-        assert query.shape == (len(output_embedding), 1, 256)
-        query = query.squeeze(1)
+        if self.history_img_feats[-1] is not None:  # skip camera cross-attn for lidar-only
+            query = self.add_branch_attention(query=query.unsqueeze(1),
+                                              reference_points=reference_points.unsqueeze(0),
+                                              value=self.history_img_feats[-1],
+                                              img_metas=self.history_img_metas[-1])
+            assert query.shape == (len(output_embedding), 1, 256)
+            query = query.squeeze(1)
         return query
     
     def _build_camera_visibility_mask(self, H, W, img_metas, device):
@@ -1409,7 +1413,7 @@ class ViP3D(MVXTwoStageDetector):
                     max(0, r - sup_r):min(H, r + sup_r + 1),
                     max(0, c - sup_r):min(W, c + sup_r + 1)] = 0.0
 
-        if img_metas is not None:
+        if img_metas is not None and 'lidar2img' in img_metas[0]:  # skipped for lidar-only
             vis_mask = self._build_camera_visibility_mask(H, W, img_metas, heatmap.device)
             scores = scores * vis_mask.unsqueeze(0).unsqueeze(0).float()
 

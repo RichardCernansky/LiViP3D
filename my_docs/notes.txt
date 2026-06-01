@@ -1,9 +1,27 @@
 //add visualizations for top-k query in both BEV and camera to see the correctness of gaussian blobs
+Stage 1 (use_camera=False, fix_feats=True)
+Stage 2 — when ready, flip back
+test <6 cameras
 
 OTAZKY KU 26.5. 2026
 1. Gradients diminishing?
 2. SCORE analysis
 python tools/score_analysis.py work_dirs/livip3d_resnet50_3cam/results_nusc.json
+
+Lidar only
+Overall:
+  TP: n=45533  mean=0.7306  median=0.7731  std=0.1758
+  FP: n=21261  mean=0.5743  median=0.5387  std=0.1607
+  FP rate: 31.8%
+
+Per class:
+  car           TP=31890 (0.739)  FP=14563 (0.570)
+  truck         TP=2073 (0.712)  FP=2225 (0.612)
+  bus           TP=  79 (0.685)  FP= 197 (0.666)
+  trailer       TP=   0 (n/a)  FP=  13 (0.421)
+  motorcycle    TP=  50 (0.624)  FP= 869 (0.501)
+  bicycle       TP=  33 (0.620)  FP=  30 (0.495)
+  pedestrian    TP=11408 (0.712)  FP=3364 (0.582)
 
 LIVIP3D 6 cam
 Overall:

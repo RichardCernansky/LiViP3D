@@ -355,7 +355,7 @@ class TransFusionTransformer(BaseModule):
     def forward(self, mlvl_feats, query_embed, reference_points, ref_size,
                 reg_branches=None, bev_feat=None, **kwargs):
         assert query_embed is not None
-        bs = mlvl_feats[0].size(0)
+        bs = mlvl_feats[0].size(0) if mlvl_feats is not None else bev_feat.size(0)  # lidar-only: no camera feats
         query_pos, query = torch.split(query_embed, self.embed_dims, dim=1)
         query_pos = query_pos.unsqueeze(0).expand(bs, -1, -1)
         query = query.unsqueeze(0).expand(bs, -1, -1)
@@ -387,11 +387,12 @@ class TransFusionTransformerDecoder(BaseModule):
     """Custom 2-layer decoder: LiDAR BEV cross-attn + SMCA camera cross-attn."""
 
     def __init__(self, embed_dims=256, num_heads=8, ffn_dims=512, dropout=0.1,
-                 lidar_bev_attn=None, smca_attn=None, **kwargs):
+                 lidar_bev_attn=None, smca_attn=None, use_camera=True, **kwargs):
         super(TransFusionTransformerDecoder, self).__init__()
         from mmcv.cnn.bricks.registry import ATTENTION as ATT_REG
         self.embed_dims = embed_dims
         self.num_layers = 2
+        self.use_camera = use_camera
 
         # ── Layer 0: self-attn + LiDAR BEV cross-attn + FFN
         self.sa0 = nn.MultiheadAttention(embed_dims, num_heads, dropout=dropout)
@@ -460,6 +461,18 @@ class TransFusionTransformerDecoder(BaseModule):
         inter_size.append(ref_size)
 
         # ── Layer 1 ──
+        if not self.use_camera:
+            # Stage 1: skip SMCA, duplicate Layer 0 output so head shape is unchanged
+            if reg_branches is not None:
+                reference_points, ref_size = self._update_ref(
+                    reg_branches[1], q, reference_points, ref_size, detach_size=True)
+            intermediate.append(q)
+            inter_ref.append(reference_points)
+            inter_size.append(ref_size)
+            return (torch.stack(intermediate),
+                    torch.stack(inter_ref),
+                    torch.stack(inter_size))
+
         q_layer0 = q.clone()  # pure layer 0 output, before ANY layer 1 operations
 
         q2, _ = self.sa1(q + query_pos, q + query_pos, q)
