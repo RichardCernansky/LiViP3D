@@ -8,6 +8,9 @@ OTAZKY KU 26.5. 2026
 2. SCORE analysis
 python tools/score_analysis.py work_dirs/livip3d_resnet50_3cam/results_nusc.json
 
+PYTHONPATH=. python tools/train.py plugin/vip3d/configs/livip3d_resnet50_lidar_img_guided.py \
+    --work-dir work_dirs/livip3d_lidar_img_guided
+
 Lidar only
 Overall:
   TP: n=45533  mean=0.7306  median=0.7731  std=0.1758

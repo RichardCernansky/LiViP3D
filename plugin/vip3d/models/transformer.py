@@ -387,12 +387,12 @@ class TransFusionTransformerDecoder(BaseModule):
     """Custom 2-layer decoder: LiDAR BEV cross-attn + SMCA camera cross-attn."""
 
     def __init__(self, embed_dims=256, num_heads=8, ffn_dims=512, dropout=0.1,
-                 lidar_bev_attn=None, smca_attn=None, use_camera=True, **kwargs):
+                 lidar_bev_attn=None, smca_attn=None, use_smca=False, **kwargs):
         super(TransFusionTransformerDecoder, self).__init__()
         from mmcv.cnn.bricks.registry import ATTENTION as ATT_REG
         self.embed_dims = embed_dims
         self.num_layers = 2
-        self.use_camera = use_camera
+        self.use_smca = use_smca
 
         # ── Layer 0: self-attn + LiDAR BEV cross-attn + FFN
         self.sa0 = nn.MultiheadAttention(embed_dims, num_heads, dropout=dropout)
@@ -461,7 +461,7 @@ class TransFusionTransformerDecoder(BaseModule):
         inter_size.append(ref_size)
 
         # ── Layer 1 ──
-        if not self.use_camera:
+        if not self.use_smca:
             # Stage 1: skip SMCA, duplicate Layer 0 output so head shape is unchanged
             if reg_branches is not None:
                 reference_points, ref_size = self._update_ref(

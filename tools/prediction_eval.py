@@ -1,8 +1,9 @@
 import argparse
 import json
 import os
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 
+import mmcv
 import numpy as np
 from pyquaternion import Quaternion  # LiViP add
 from scipy.optimize import linear_sum_assignment
@@ -34,10 +35,12 @@ class PredAgent:
                  sample_token: str = "",
                  translation: np.ndarray = np.zeros(2),
                  pred_future_trajs: np.ndarray = np.zeros((cfg.pred_traj_num, cfg.future_frame_num, 2)),
+                 tracking_name: str = "",
                  ):
         self.sample_token = sample_token
         self.translation = translation.copy()
         self.pred_future_trajs = pred_future_trajs.copy()
+        self.tracking_name = tracking_name
 
     @classmethod
     def deserialize(cls, content: dict):
@@ -52,6 +55,7 @@ class PredAgent:
         return cls(
             translation=translation,
             pred_future_trajs=pred_future_trajs,
+            tracking_name=content.get('tracking_name', ''),
         )
 
 
@@ -184,7 +188,7 @@ def is_camera_visible(center_global, global2img, img_h=900, img_w=1600):
     return False
 
 
-def get_gt_agents(prediction_infos, index):
+def get_gt_agents(prediction_infos, index, class_indices: Optional[set] = None):
     idx_2_gt_agent = {}
 
     for i in range(index, index + 1 + cfg.future_frame_num):
@@ -201,6 +205,10 @@ def get_gt_agents(prediction_infos, index):
 
         for box_idx, instance_idx in enumerate(instance_inds):
             assert instance_idx != -1
+
+            if class_indices is not None and gt_labels_3d[box_idx] not in class_indices:
+                continue
+
             if i == index:
                 assert instance_idx not in idx_2_gt_agent
                 idx_2_gt_agent[instance_idx] = GTAgent()
@@ -227,7 +235,8 @@ class PredictionEval:
                  prediction_infos_path: str = None,
                  nusc_dataroot: str = None,
                  nusc_version: str = 'v1.0-trainval',
-                 camera_types: List[str] = None):
+                 camera_types: List[str] = None,
+                 class_indices: Optional[set] = None):
         """
         Parameters
         ----------
@@ -295,6 +304,9 @@ class PredictionEval:
         else:
             self.nusc = None  # LiViP add end
 
+        self.class_indices = class_indices  # set of int label indices to evaluate, or None for all
+        self._eval_class_names = None
+
     def evaluate(self):
         metrics = PredictionMetrics()
 
@@ -307,7 +319,7 @@ class PredictionEval:
             if sample_token not in self.sample_token_2_pred_agents:
                 break
 
-            gt_agents: List[GTAgent] = get_gt_agents(self.prediction_infos, index)
+            gt_agents: List[GTAgent] = get_gt_agents(self.prediction_infos, index, self.class_indices)
             # LiViP add: filter GT to camera-visible agents only
             if self.nusc is not None:
                 global2img = build_global2img(self.nusc, sample_token, self.camera_types)
@@ -326,6 +338,9 @@ class PredictionEval:
                 pred_agents = [a for a in pred_agents
                                if is_camera_visible(a.translation, global2img)]
             # LiViP add end
+            if self.class_indices is not None:
+                pred_agents = [a for a in pred_agents
+                               if a.tracking_name in self._eval_class_names]
 
             if len(gt_agents) > 0:
 
@@ -390,6 +405,14 @@ class PredictionEval:
     def main(self) -> Dict[str, Any]:
         metrics: PredictionMetrics = self.evaluate()
 
+        print(f'\n--- EPA breakdown ---')
+        print(f'  gt_agent_num (valid final traj): {metrics.gt_agent_num.get_sum():.0f}')
+        print(f'  matched_and_prediction_hit:      {metrics.matched_and_prediction_hit.get_sum():.0f}')
+        print(f'  unmatched predictions:           {metrics.unmatched.get_sum():.0f}')
+        print(f'  unmatched penalty (×0.5):        {metrics.unmatched.get_sum() * 0.5:.0f}')
+        print(f'  numerator (hits - penalty):      {metrics.matched_and_prediction_hit.get_sum() - metrics.unmatched.get_sum() * 0.5:.1f}')
+        print(f'---------------------\n')
+
         print(f'Saving metrics to: {self.output_dir}/prediction_metrics.json')
         metrics_summary = metrics.serialize()
 
@@ -407,15 +430,29 @@ def main():
     parser.add_argument('--prediction_infos_path',
                         default='./nuscenes_prediction_infos_val.json',
                         help='path of preprocessed gt boxes in JSON format')
+    parser.add_argument('--config', default=None,
+                        help='mmdet3d config file; reads prediction_eval_classes and class_names from it')
     parser.add_argument('--nusc_dataroot', default=None,  # LiViP add
                         help='NuScenes dataroot; if set, filters GT to camera-visible objects only')
     parser.add_argument('--nusc_version', default='v1.0-trainval')  # LiViP add
     args = parser.parse_args()
 
+    class_indices = None
+    eval_class_names = None
+    if args.config is not None:
+        model_cfg = mmcv.Config.fromfile(args.config)
+        all_classes = model_cfg.get('class_names', [])
+        eval_classes = model_cfg.get('prediction_eval_classes', all_classes)
+        class_indices = {all_classes.index(c) for c in eval_classes if c in all_classes}
+        eval_class_names = set(eval_classes)
+        print(f'Evaluating on classes: {eval_classes}')
+
     nusc_eval = PredictionEval(result_path=args.result_path,
                                prediction_infos_path=args.prediction_infos_path,
                                nusc_dataroot=args.nusc_dataroot,
-                               nusc_version=args.nusc_version)
+                               nusc_version=args.nusc_version,
+                               class_indices=class_indices)
+    nusc_eval._eval_class_names = eval_class_names
 
     nusc_eval.main()
 

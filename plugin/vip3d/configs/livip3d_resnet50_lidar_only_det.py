@@ -16,11 +16,6 @@ class_names = [
     'car', 'truck', 'bus', 'trailer',
     'motorcycle', 'bicycle', 'pedestrian',
 ]
-# prediction_eval_classes = ['car', 'pedestrian'] 
-prediction_eval_classes = [
-    'car', 'truck', 'bus', 'trailer',
-    'motorcycle', 'bicycle', 'pedestrian',
-]
 
 input_modality = dict(
     use_lidar=True,
@@ -40,7 +35,7 @@ model = dict(
         pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
         max_num=100,
         num_classes=7),
-    fix_feats=True,   # frozen — no camera gradients, saves ~4GB activation memory
+    fix_feats=True,
     fix_lidar=False,
     score_thresh=0.4,
     filter_score_thresh=0.35,
@@ -171,21 +166,11 @@ model = dict(
     debug=False,
     bev_vis=True,
     vis_interval=20,
-    use_img_guided=False,
     use_smca=False,
-    do_pred=True,
-    relative_pred=True,
-    agents_layer_0=True,
-    add_branch=True,
-    predictor=dict(
-        hidden_size=128,
-        laneGCN=True,
-        decoder=dict(
-            variety_loss=True,
-            variety_loss_prob=True,
-            hidden_size=128,
-        ),
-    ),
+    do_pred=False,
+    relative_pred=False,
+    agents_layer_0=False,
+    add_branch=False,
     train_cfg=dict(
         pts=dict(
             grid_size=[512, 512, 1],
@@ -233,8 +218,7 @@ train_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
         'gt_bboxes_3d', 'gt_labels_3d', 'instance_inds',
-        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
-        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
+        'points', 'timestamp', 'l2g_r_mat', 'l2g_t']),
 ]
 
 test_pipeline = [
@@ -258,8 +242,7 @@ test_pipeline_post = [
     dict(type='FormatBundle3DTrack'),
     dict(type='Collect3D', keys=[
         'gt_bboxes_3d', 'gt_labels_3d',
-        'points', 'timestamp', 'l2g_r_mat', 'l2g_t',
-        'pred_matrix', 'polyline_spans', 'mapping', 'instance_idx_2_labels']),
+        'points', 'timestamp', 'l2g_r_mat', 'l2g_t']),
 ]
 
 data = dict(
@@ -278,7 +261,7 @@ data = dict(
         use_valid_flag=True,
         box_type_3d='LiDAR',
         camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-        do_pred=True),
+        do_pred=False),
     val=dict(
         type=dataset_type,
         pipeline_single=test_pipeline,
@@ -288,7 +271,7 @@ data = dict(
         ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
         num_frames_per_sample=1,
         camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-        do_pred=True),
+        do_pred=False),
     test=dict(
         type=dataset_type,
         pipeline_single=test_pipeline,
@@ -298,15 +281,15 @@ data = dict(
         ann_file=data_root + 'nuscenes_tracking_infos_val.pkl',
         num_frames_per_sample=1,
         camera_types=['CAM_FRONT', 'CAM_FRONT_LEFT', 'CAM_FRONT_RIGHT', 'CAM_BACK', 'CAM_BACK_LEFT', 'CAM_BACK_RIGHT'],
-        do_pred=True))
+        do_pred=False))
 
 optimizer = dict(
     type='AdamW',
     lr=2e-4,
     paramwise_cfg=dict(
         custom_keys={
-            'img_backbone': dict(lr_mult=0.0),  # frozen, no update needed
-            'img_neck':     dict(lr_mult=0.0),  # frozen
+            'img_backbone': dict(lr_mult=0.0),
+            'img_neck':     dict(lr_mult=0.0),
             'pts_backbone': dict(lr_mult=0.1),
             'pts_neck':     dict(lr_mult=0.1),
             'heatmap_head': dict(lr_mult=0.1),
@@ -325,9 +308,9 @@ lr_config = dict(
     warmup_ratio=1.0 / 3,
     min_lr_ratio=1e-3,
 )
-total_epochs = 20 
-evaluation = dict(interval=20)
-runner = dict(type='EpochBasedRunner', max_epochs=20)
+total_epochs = 15
+evaluation = dict(interval=15)
+runner = dict(type='EpochBasedRunner', max_epochs=15)
 
 find_unused_parameters = True
 load_from = 'ckpt_init/livip3d_init.pth'

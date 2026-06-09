@@ -84,6 +84,47 @@ class RuntimeTrackerBase(object):
                 track_instances.pred_logits[i] = old_class_scores[i]
 
 
+class ImageGuidedBEVProjection(nn.Module):
+    """
+    Projects image features onto the BEV plane via cross-attention with LiDAR BEV features.
+    Implements Figure 4 of TransFusion (Section 3.6):
+      1. Collapse image height axis → column features [B, N_cams*W, C]
+      2. Cross-attention: Q=BEV locations, K/V=image columns → F_LC [B, C_bev, H, W]
+    """
+    def __init__(self, bev_channels, img_channels=256, embed_dims=256, num_heads=8):
+        super().__init__()
+        self.bev_proj = nn.Linear(bev_channels, embed_dims)
+        self.img_proj = nn.Linear(img_channels, embed_dims)
+        self.cross_attn = nn.MultiheadAttention(embed_dims, num_heads, batch_first=True)
+        self.out_proj = nn.Linear(embed_dims, bev_channels)
+        self.norm = nn.LayerNorm(embed_dims)
+
+    def forward(self, bev_feat, img_feats):
+        """
+        Args:
+            bev_feat:  [B, C_bev, H, W]
+            img_feats: list of [B, N_cams, C_img, H_img, W_img]
+        Returns:
+            F_LC: [B, C_bev, H, W]
+        """
+        B, C_bev, H, W = bev_feat.shape
+        img = img_feats[0]  # highest-res FPN level
+        _, N_cams, C_img, H_img, W_img = img.shape
+
+        # Collapse height axis via max → [B, N_cams*W_img, C_img]
+        img_kv = img.max(dim=3).values.permute(0, 1, 3, 2).reshape(B, N_cams * W_img, C_img)
+        img_kv = self.img_proj(img_kv)
+
+        # BEV as queries → [B, H*W, embed_dims]
+        bev_q = self.bev_proj(bev_feat.permute(0, 2, 3, 1).reshape(B, H * W, C_bev))
+
+        attn_out, _ = self.cross_attn(bev_q, img_kv, img_kv)
+        attn_out = self.norm(bev_q + attn_out)
+
+        F_LC = self.out_proj(attn_out).reshape(B, H, W, C_bev).permute(0, 3, 1, 2)
+        return F_LC
+
+
 @DETECTORS.register_module()
 class ViP3D(MVXTwoStageDetector):
     def __init__(self,
@@ -132,6 +173,8 @@ class ViP3D(MVXTwoStageDetector):
                  debug=False,
                  bev_vis=True,
                  vis_interval=20,
+                 use_img_guided=False,
+                 use_smca=False,
                  ):
         super(ViP3D,
               self).__init__(pts_voxel_layer, pts_voxel_encoder,
@@ -157,6 +200,9 @@ class ViP3D(MVXTwoStageDetector):
             self.img_backbone.eval()
             self.img_neck.eval()
         self.bbox_size_fc = nn.Linear(self.embed_dims, 3)
+
+        self.use_smca = use_smca
+        self.pts_bbox_head.transformer.decoder.use_smca = use_smca
 
         self.use_lidar = use_lidar
         self.heatmap_score_thresh = heatmap_score_thresh
@@ -200,6 +246,24 @@ class ViP3D(MVXTwoStageDetector):
             self.hm_task5 = _task_head(2)   # pedestrian, traffic_cone
             # Projects BEV channels → embed_dims for query content vector
             self.lidar_bev_proj = nn.Linear(lidar_bev_channels, embed_dims)
+
+            self.use_img_guided = use_img_guided
+            if self.use_img_guided:
+                self.img_bev_proj = ImageGuidedBEVProjection(
+                    bev_channels=lidar_bev_channels,
+                    img_channels=256,
+                    embed_dims=embed_dims,
+                )
+                self.img_hm_head = nn.Sequential(
+                    nn.Conv2d(lidar_bev_channels, 64, 3, padding=1),
+                    nn.BatchNorm2d(64),
+                    nn.ReLU(inplace=True),
+                )
+                self.img_hm_task0 = _task_head(1)   # car
+                self.img_hm_task1 = _task_head(2)   # truck, cveh
+                self.img_hm_task2 = _task_head(2)   # bus, trailer
+                self.img_hm_task4 = _task_head(2)   # motorcycle, bicycle
+                self.img_hm_task5 = _task_head(2)   # pedestrian, traffic_cone
 
         self.track_base = RuntimeTrackerBase(
             score_thresh=score_thresh,
@@ -512,6 +576,21 @@ class ViP3D(MVXTwoStageDetector):
                 t4[:, 1:],                       # bicycle
                 t5[:, :1],                       # pedestrian
             ], dim=1)
+
+            if self.use_img_guided and img_feats is not None:
+                F_LC = self.img_bev_proj(bev_feat, img_feats)
+                img_shared = self.img_hm_head(F_LC)
+                _it2 = self.img_hm_task2(img_shared)
+                _it4 = self.img_hm_task4(img_shared)
+                _it5 = self.img_hm_task5(img_shared)
+                img_heatmap = torch.cat([
+                    self.img_hm_task0(img_shared),
+                    self.img_hm_task1(img_shared)[:, :1],
+                    _it2[:, :1], _it2[:, 1:],
+                    _it4[:, :1], _it4[:, 1:],
+                    _it5[:, :1],
+                ], dim=1)
+                heatmap = (heatmap + img_heatmap) * 0.5
 
             # 1. fill so far empty slots
             empty_mask = track_instances.obj_idxes < 0
@@ -943,6 +1022,22 @@ class ViP3D(MVXTwoStageDetector):
                     _t4[:, :1], _t4[:, 1:],
                     _t5[:, :1],
                 ], dim=1)
+
+                if self.use_img_guided and img_feats is not None:
+                    F_LC = self.img_bev_proj(bev_feat, img_feats)
+                    img_shared = self.img_hm_head(F_LC)
+                    _it2 = self.img_hm_task2(img_shared)
+                    _it4 = self.img_hm_task4(img_shared)
+                    _it5 = self.img_hm_task5(img_shared)
+                    img_heatmap = torch.cat([
+                        self.img_hm_task0(img_shared),
+                        self.img_hm_task1(img_shared)[:, :1],
+                        _it2[:, :1], _it2[:, 1:],
+                        _it4[:, :1], _it4[:, 1:],
+                        _it5[:, :1],
+                    ], dim=1)
+                    heatmap = (heatmap + img_heatmap) * 0.5
+
                 empty_mask = track_instances.obj_idxes < 0
                 num_empty  = int(empty_mask.sum())
                 if num_empty > 0:
