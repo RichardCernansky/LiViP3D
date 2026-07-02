@@ -86,16 +86,21 @@ class RuntimeTrackerBase(object):
 
 class ImageGuidedBEVProjection(nn.Module):
     """
-    Projects image features onto the BEV plane via cross-attention with LiDAR BEV features.
+    Projects image features onto the BEV plane via per-camera cross-attention.
     Implements Figure 4 of TransFusion (Section 3.6):
-      1. Collapse image height axis → column features [B, N_cams*W, C]
-      2. Cross-attention: Q=BEV locations, K/V=image columns → F_LC [B, C_bev, H, W]
+      1. Collapse image height axis via max → column features [B, W, C] per camera
+      2. Per-camera MHA: Q=BEV locations, K/V=camera columns → F_LC_i per camera
+      3. Average F_LC_i across cameras → F_LC [B, C_bev, H, W]
     """
-    def __init__(self, bev_channels, img_channels=256, embed_dims=256, num_heads=8):
+    def __init__(self, bev_channels, img_channels=256, embed_dims=256, num_heads=8, num_cams=6):
         super().__init__()
+        self.num_cams = num_cams
         self.bev_proj = nn.Linear(bev_channels, embed_dims)
         self.img_proj = nn.Linear(img_channels, embed_dims)
-        self.cross_attn = nn.MultiheadAttention(embed_dims, num_heads, batch_first=True)
+        self.cross_attns = nn.ModuleList([
+            nn.MultiheadAttention(embed_dims, num_heads, batch_first=True)
+            for _ in range(num_cams)
+        ])
         self.out_proj = nn.Linear(embed_dims, bev_channels)
         self.norm = nn.LayerNorm(embed_dims)
 
@@ -111,17 +116,25 @@ class ImageGuidedBEVProjection(nn.Module):
         img = img_feats[0]  # highest-res FPN level
         _, N_cams, C_img, H_img, W_img = img.shape
 
-        # Collapse height axis via max → [B, N_cams*W_img, C_img]
-        img_kv = img.max(dim=3).values.permute(0, 1, 3, 2).reshape(B, N_cams * W_img, C_img)
-        img_kv = self.img_proj(img_kv)
+        # Collapse height axis via max → [B, N_cams, W_img, C_img] then project
+        img_cols = img.max(dim=3).values           # [B, N_cams, C_img, W_img]
+        img_cols = img_cols.permute(0, 1, 3, 2)    # [B, N_cams, W_img, C_img]
+        img_cols = self.img_proj(img_cols)          # [B, N_cams, W_img, D]
 
-        # BEV as queries → [B, H*W, embed_dims]
+        # BEV as queries → [B, H*W, D]
         bev_q = self.bev_proj(bev_feat.permute(0, 2, 3, 1).reshape(B, H * W, C_bev))
 
-        attn_out, _ = self.cross_attn(bev_q, img_kv, img_kv)
-        attn_out = self.norm(bev_q + attn_out)
+        # Per-camera attention, average across cameras
+        n = min(N_cams, self.num_cams)
+        cam_outs = []
+        for i in range(n):
+            kv_i = img_cols[:, i]                          # [B, W_img, D]
+            attn_i, _ = self.cross_attns[i](bev_q, kv_i, kv_i)
+            cam_outs.append(attn_i)
+        attn_avg = torch.stack(cam_outs, dim=0).mean(dim=0)  # [B, H*W, D]
+        attn_avg = self.norm(bev_q + attn_avg)
 
-        F_LC = self.out_proj(attn_out).reshape(B, H, W, C_bev).permute(0, 3, 1, 2)
+        F_LC = self.out_proj(attn_avg).reshape(B, H, W, C_bev).permute(0, 3, 1, 2)
         return F_LC
 
 
@@ -253,6 +266,7 @@ class ViP3D(MVXTwoStageDetector):
                     bev_channels=lidar_bev_channels,
                     img_channels=256,
                     embed_dims=embed_dims,
+                    num_cams=pts_bbox_head.get('num_cams', 6) if pts_bbox_head else 6,
                 )
                 self.img_hm_head = nn.Sequential(
                     nn.Conv2d(lidar_bev_channels, 64, 3, padding=1),
@@ -547,7 +561,7 @@ class ViP3D(MVXTwoStageDetector):
         if img is not None:  # lidar-only: img is None, B/num_cam/H/W unused
             B, num_cam, _, H, W = img.shape
 
-        if not hasattr(self, '_heatmap_verified'):
+        if self.use_lidar and not hasattr(self, '_heatmap_verified'):
             self._heatmap_verified = True
             print(f'[verify] heatmap_head[0].weight.sum()={self.heatmap_head[0].weight.data.sum().item():.3f} (expected -2340.769)')
             print(f'[verify] hm_task0[-1].bias={self.hm_task0[-1].bias.data.tolist()} (expected [-0.375])')
@@ -577,6 +591,7 @@ class ViP3D(MVXTwoStageDetector):
                 t5[:, :1],                       # pedestrian
             ], dim=1)
 
+            feat_for_queries = bev_feat
             if self.use_img_guided and img_feats is not None:
                 F_LC = self.img_bev_proj(bev_feat, img_feats)
                 img_shared = self.img_hm_head(F_LC)
@@ -591,6 +606,7 @@ class ViP3D(MVXTwoStageDetector):
                     _it5[:, :1],
                 ], dim=1)
                 heatmap = (heatmap + img_heatmap) * 0.5
+                feat_for_queries = F_LC
 
             # 1. fill so far empty slots
             empty_mask = track_instances.obj_idxes < 0
@@ -599,14 +615,14 @@ class ViP3D(MVXTwoStageDetector):
                 active_ref = track_instances.ref_pts[track_instances.obj_idxes >= 0] \
                             if (track_instances.obj_idxes >= 0).any() else None
                 new_ref_pts, new_queries, _ = self.select_topk_from_heatmap(
-                    heatmap, bev_feat, num_select=num_empty, active_ref_pts=active_ref, img_metas=img_metas)
+                    heatmap, feat_for_queries, num_select=num_empty, active_ref_pts=active_ref, img_metas=img_metas)
 
                 track_instances.ref_pts = track_instances.ref_pts.clone()
                 track_instances.query   = track_instances.query.clone()
                 track_instances.ref_pts[empty_mask] = new_ref_pts
                 track_instances.query[empty_mask]   = new_queries
 
-                # store top-20 for SMCA visualisation
+                # debug vis - store top-20 for SMCA visualisation
                 from .bev_vis import set_top_queries as _set_tq
                 empty_indices = empty_mask.nonzero(as_tuple=False)[:, 0]
                 top20_idx = empty_indices[:20]
@@ -1023,6 +1039,7 @@ class ViP3D(MVXTwoStageDetector):
                     _t5[:, :1],
                 ], dim=1)
 
+                feat_for_queries = bev_feat
                 if self.use_img_guided and img_feats is not None:
                     F_LC = self.img_bev_proj(bev_feat, img_feats)
                     img_shared = self.img_hm_head(F_LC)
@@ -1037,6 +1054,7 @@ class ViP3D(MVXTwoStageDetector):
                         _it5[:, :1],
                     ], dim=1)
                     heatmap = (heatmap + img_heatmap) * 0.5
+                    feat_for_queries = F_LC
 
                 empty_mask = track_instances.obj_idxes < 0
                 num_empty  = int(empty_mask.sum())
@@ -1044,7 +1062,7 @@ class ViP3D(MVXTwoStageDetector):
                     active_ref = track_instances.ref_pts[track_instances.obj_idxes >= 0] \
                                 if (track_instances.obj_idxes >= 0).any() else None
                     new_ref_pts, new_queries, hm_scores = self.select_topk_from_heatmap(
-                        heatmap, bev_feat, num_select=num_empty, active_ref_pts=active_ref, img_metas=img_metas)
+                        heatmap, feat_for_queries, num_select=num_empty, active_ref_pts=active_ref, img_metas=img_metas)
 
                     # Always fill all empty slots with heatmap positions so ref_pts are
                     # spread across the BEV rather than sitting at zero (vehicle origin).

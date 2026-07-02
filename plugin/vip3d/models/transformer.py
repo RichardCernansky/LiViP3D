@@ -241,6 +241,7 @@ class Detr3DCamTrackTransformer(BaseModule):
         return inter_states, inter_references, inter_box_sizes
 
 
+# livip add - 
 @TRANSFORMER_LAYER_SEQUENCE.register_module()
 class Detr3DCamTrackPlusTransformerDecoder(TransformerLayerSequence):
     """Implements the decoder in DETR transformer.
@@ -460,7 +461,7 @@ class TransFusionTransformerDecoder(BaseModule):
         inter_ref.append(reference_points)
         inter_size.append(ref_size)
 
-        # ── Layer 1 ──
+        # Layer 1 
         if not self.use_smca:
             # Stage 1: skip SMCA, duplicate Layer 0 output so head shape is unchanged
             if reg_branches is not None:

@@ -48,9 +48,9 @@ def set_top_queries(ref_pts, indices):
     indices : Tensor [K]     integer indices into the full query tensor
     """
     global _top_q_ref, _top_q_idx
-    import numpy as np
-    _top_q_ref = ref_pts[:, :2].detach().cpu().numpy()   # [K, 2]
-    _top_q_idx = indices.detach().cpu()                   # [K] int tensor
+    import torch, numpy as np
+    _top_q_ref = ref_pts[:, :2].sigmoid().detach().cpu().numpy()   # [K, 2] → [0,1] for scatter
+    _top_q_idx = indices.detach().cpu()                             # [K] int tensor
 
 
 def store_smca_attn(attn_per_cam, H0, W0):
@@ -102,47 +102,53 @@ def visualize_train_smca(heatmap, img):
     num_cams = len(_smca_attn)
     H0, W0   = _smca_feat_hw
 
-    num_cams_vis = min(num_cams, img[0].shape[0])  # pre-compute for figure layout
-    fig, axes = plt.subplots(1, num_cams_vis + 1, figsize=(6 * (num_cams_vis + 1), 6))
+    num_cams_vis = min(num_cams, img.shape[0], 3)
+    # 2 rows: row 0 = overlay, row 1 = pure attention; col 0 = BEV heatmap
+    fig, axes = plt.subplots(2, num_cams_vis + 1, figsize=(6 * (num_cams_vis + 1), 12))
 
-    # ── Panel 0: BEV heatmap + top-K query dots ─────────────────────────────
+    # ── Panel [0,0]: BEV heatmap + top-K query dots ──────────────────────────
     hm = heatmap[0].detach().float().sigmoid().cpu().numpy()  # [K_cls, H, W]
     bg = hm.max(axis=0)
     bg = bg / (bg.max() + 1e-6)
-    axes[0].imshow(bg, cmap='jet', origin='lower',
-                   extent=[0, 1, 0, 1], aspect='auto', vmin=0, vmax=1)
-    axes[0].scatter(_top_q_ref[:, 0], _top_q_ref[:, 1],
-                    c='cyan', s=30, zorder=3, edgecolors='black', linewidths=0.3,
-                    label=f'top-{len(_top_q_ref)} queries')
-    axes[0].set_title(f'Heatmap + top-{len(_top_q_ref)} queries  step={step}')
-    axes[0].set_xlabel('x (norm BEV)'); axes[0].set_ylabel('y (norm BEV)')
-    axes[0].legend(fontsize=7)
+    axes[0, 0].imshow(bg, cmap='jet', origin='lower',
+                      extent=[0, 1, 0, 1], aspect='auto', vmin=0, vmax=1)
+    axes[0, 0].scatter(_top_q_ref[:, 0], _top_q_ref[:, 1],
+                       c='cyan', s=30, zorder=3, edgecolors='black', linewidths=0.3,
+                       label=f'top-{len(_top_q_ref)} queries')
+    axes[0, 0].set_title(f'Heatmap + top-{len(_top_q_ref)} queries  step={step}')
+    axes[0, 0].set_xlabel('x (norm BEV)'); axes[0, 0].set_ylabel('y (norm BEV)')
+    axes[0, 0].legend(fontsize=7)
+    axes[1, 0].axis('off')
 
-    # ── BGR image denorm: mean=[103.53, 116.28, 123.675], std=1, to_rgb=False
-    img_np = img[0].detach().cpu().float().numpy()  # [num_cam_img, 3, H_img, W_img]
+    # ── BGR image denorm ──────────────────────────────────────────────────────
+    img_np = img.detach().cpu().float().numpy()
     mean   = np.array([103.530, 116.280, 123.675], dtype=np.float32).reshape(3, 1, 1)
-    # img backbone may see fewer cameras than SMCA (e.g. front-3 backbone, 6-cam attention)
-    num_cams_vis = min(num_cams, img_np.shape[0])
+    print(f'[bev_vis] img shape={img.shape}, img_np.shape={img_np.shape}, smca_cams={num_cams}')
+    if img_np.shape[0] > 1:
+        diff01 = np.abs(img_np[0] - img_np[1]).mean()
+        print(f'[bev_vis] mean pixel diff cam0 vs cam1: {diff01:.2f}')
+    num_cams_vis = min(num_cams, img_np.shape[0], 3)
 
     for cam_i in range(num_cams_vis):
-        ax = axes[cam_i + 1]
-
-        # Denorm + convert BGR→RGB for display
         cam_bgr = (img_np[cam_i] + mean).clip(0, 255).astype(np.uint8)
         cam_rgb = cam_bgr[::-1].transpose(1, 2, 0)          # [H_img, W_img, 3]
         H_img, W_img = cam_rgb.shape[:2]
 
-        # Attention: max over top-K queries → [H0*W0] → [H0, W0] → upsample
-        attn = _smca_attn[cam_i]                            # [K, H0*W0]
-        attn_map = attn.max(axis=0).reshape(H0, W0)        # [H0, W0]
-        attn_map = (attn_map - attn_map.min()) / (attn_map.max() + 1e-6)
-        attn_up  = cv2.resize(attn_map, (W_img, H_img),
-                              interpolation=cv2.INTER_LINEAR)
+        attn = _smca_attn[cam_i]                             # [K, H0*W0]
+        attn_map = attn.max(axis=0).reshape(H0, W0)         # [H0, W0]
+        attn_map = (attn_map - attn_map.min()) / (attn_map.max() - attn_map.min() + 1e-6)
+        attn_up  = cv2.resize(attn_map, (W_img, H_img), interpolation=cv2.INTER_LINEAR)
 
-        ax.imshow(cam_rgb)
-        ax.imshow(attn_up, cmap='hot', alpha=0.5, vmin=0, vmax=1)
-        ax.set_title(f'Cam {cam_i}  step={step}')
-        ax.axis('off')
+        # Row 0: overlaid on image
+        axes[0, cam_i + 1].imshow(cam_rgb)
+        axes[0, cam_i + 1].imshow(attn_up, cmap='hot', alpha=0.5, vmin=0, vmax=1)
+        axes[0, cam_i + 1].set_title(f'Cam {cam_i}  step={step}')
+        axes[0, cam_i + 1].axis('off')
+
+        # Row 1: pure attention only
+        axes[1, cam_i + 1].imshow(attn_up, cmap='hot', vmin=0, vmax=1)
+        axes[1, cam_i + 1].set_title(f'Cam {cam_i} (pure attn)')
+        axes[1, cam_i + 1].axis('off')
 
     fig.suptitle(f'SMCA attention for top-{len(_top_q_ref)} heatmap queries')
     fig.tight_layout()
@@ -178,9 +184,10 @@ def visualize_smca_gauss(img):
     H0, W0   = _smca_feat_hw
     num_cams = len(_smca_gauss)
 
-    img_np = img[0].detach().cpu().float().numpy()        # [num_cam_img, 3, H_img, W_img]
+    # img is [num_cam, 3, H, W] after extract_feat squeezes B=1 dim
+    img_np = img.detach().cpu().float().numpy()           # [num_cam, 3, H_img, W_img]
     mean   = np.array([103.530, 116.280, 123.675], dtype=np.float32).reshape(3, 1, 1)
-    num_cams_vis = min(num_cams, img_np.shape[0])
+    num_cams_vis = min(num_cams, img_np.shape[0], 3)
 
     fig, axes = plt.subplots(1, num_cams_vis, figsize=(6 * num_cams_vis, 6))
     if num_cams_vis == 1:

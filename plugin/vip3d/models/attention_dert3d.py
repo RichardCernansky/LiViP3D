@@ -784,7 +784,8 @@ class SMCACrossAtten(BaseModule):
     """Spatially Modulated Cross-Attention (SMCA) over multi-level camera FPN features."""
 
     def __init__(self, embed_dims=256, num_heads=8, num_cams=3, num_levels=4,
-                 pc_range=None, dropout=0.1, init_cfg=None):
+                 pc_range=None, dropout=0.1, sigma_scale=1.0, feat_level=1,
+                 init_cfg=None):
         super(SMCACrossAtten, self).__init__(init_cfg)
         self.embed_dims = embed_dims
         self.num_heads = num_heads
@@ -792,10 +793,9 @@ class SMCACrossAtten(BaseModule):
         self.num_levels = num_levels
         self.pc_range = pc_range
         self.scale = (embed_dims // num_heads) ** -0.5
+        self.sigma_scale = sigma_scale  # paper's σ hyper-parameter: sigma_px = σ * r
+        self.feat_level = feat_level    # which FPN level to use (0=finest, 3=coarsest)
         self.dropout = nn.Dropout(dropout)
-
-        # fuse all 4 FPN levels into one [B, N, 256, H0, W0] representation
-        self.fusion_proj = nn.Linear(num_levels * embed_dims, embed_dims)
 
         self.q_proj = nn.Linear(embed_dims, embed_dims)
         self.k_proj = nn.Linear(embed_dims, embed_dims)
@@ -811,27 +811,21 @@ class SMCACrossAtten(BaseModule):
             nn.ReLU(inplace=True),
         )
 
-    def _fuse_fpn_levels(self, mlvl_feats):
-        """Upsample levels 1-3 to level-0 size, concat, project.
-        Args:
-            mlvl_feats: list of [B, N, C, H_l, W_l]
-        Returns:
-            [B, N, embed_dims, H0, W0]
-        """
-        B, N, C, H0, W0 = mlvl_feats[0].shape
-        upsampled = [mlvl_feats[0]]
-        for feat in mlvl_feats[1:]:
-            # [B*N, C, H_l, W_l] → upsample → [B, N, C, H0, W0]
-            f = feat.view(B * N, C, feat.shape[-2], feat.shape[-1])
-            f = F.interpolate(f, size=(H0, W0), mode='bilinear', align_corners=False)
-            upsampled.append(f.view(B, N, C, H0, W0))
-        # concat along channel dim → [B, N, num_levels*C, H0, W0]
-        fused = torch.cat(upsampled, dim=2)
-        # [B, N, H0, W0, num_levels*C] → linear → [B, N, H0, W0, embed_dims]
-        fused = fused.permute(0, 1, 3, 4, 2)
-        fused = self.fusion_proj(fused)
-        # → [B, N, embed_dims, H0, W0]
-        return fused.permute(0, 1, 4, 2, 3)
+    # def _fuse_fpn_levels(self, mlvl_feats):
+    #     B, N, C, H0, W0 = mlvl_feats[0].shape
+    #     upsampled = [mlvl_feats[0]]
+    #     for feat in mlvl_feats[1:]:
+    #         f = feat.view(B * N, C, feat.shape[-2], feat.shape[-1])
+    #         f = F.interpolate(f, size=(H0, W0), mode='bilinear', align_corners=False)
+    #         upsampled.append(f.view(B, N, C, H0, W0))
+    #     fused = torch.cat(upsampled, dim=2)
+    #     fused = fused.permute(0, 1, 3, 4, 2)
+    #     fused = self.fusion_proj(fused)
+    #     return fused.permute(0, 1, 4, 2, 3)
+
+    def _select_feat_level(self, mlvl_feats):
+        """Pick single FPN level: [B, N, C, H_l, W_l]"""
+        return mlvl_feats[self.feat_level]
 
     def _project_to_cameras(self, reference_points, img_metas):
         """Project 3D reference points into each camera image plane.
@@ -950,9 +944,9 @@ class SMCACrossAtten(BaseModule):
         any_front = front.any(dim=-1)                         # [B, num_cams, num_q]
         u_range = torch.where(any_front, u_range, torch.full_like(u_range, 4.0))
         v_range = torch.where(any_front, v_range, torch.full_like(v_range, 4.0))
-        radius = torch.ceil(torch.stack([u_range, v_range], dim=-1).norm(p=2, dim=-1) / 2)
-        sigma  = (radius * 2 + 1) / 6.0
-        sigma  = sigma.clamp(min=1.0, max=50.0)               # guard against residual outliers
+        radius = torch.stack([u_range, v_range], dim=-1).norm(p=2, dim=-1) / 2
+        sigma  = self.sigma_scale * radius                     # paper: M = exp(-d²/(σ²r²))
+        sigma  = sigma.clamp(min=1.0, max=50.0)
 
         return sigma.permute(0, 2, 1)  # [B, num_q, num_cams]
 
@@ -977,7 +971,7 @@ class SMCACrossAtten(BaseModule):
         sigma  = sigma.unsqueeze(-1)    # [B, num_q, num_cams, 1]
 
         gauss = torch.exp(
-            -0.5 * ((grid_x - cx_pix) ** 2 + (grid_y - cy_pix) ** 2) / sigma ** 2
+            -((grid_x - cx_pix) ** 2 + (grid_y - cy_pix) ** 2) / sigma ** 2
         )
         return gauss  # [B, num_q, num_cams, H*W]
 
@@ -999,9 +993,11 @@ class SMCACrossAtten(BaseModule):
             query = query + query_pos
 
         num_q, B, _ = query.shape
+        H = self.num_heads
+        head_dim = self.embed_dims // H
 
-        # ── fuse all 4 FPN levels → [B, num_cams, embed_dims, H0, W0]
-        img_feat = self._fuse_fpn_levels(value)
+        # ── single FPN level [B, num_cams, embed_dims, H0, W0]
+        img_feat = self._select_feat_level(value)
         H0, W0 = img_feat.shape[-2], img_feat.shape[-1]
 
         # ── project reference points to camera planes
@@ -1017,12 +1013,13 @@ class SMCACrossAtten(BaseModule):
         if _bv.DEBUG_PRINTS:
             print(f"[SMCA] sigma mean={sigma.mean():.2f}  max={sigma.max():.2f}  (expect 2-15px)")
         gauss = self._gaussian_mask(cx, cy, sigma, H0, W0, query.device, query.dtype)
+        # gauss: [B, num_q, num_cams, H0*W0]
 
-        # ── SMCA cross-attention per camera, then average
-        # query: [num_q, B, D] → [B, num_q, D]
-        q = self.q_proj(query.permute(1, 0, 2))  # [B, num_q, D]
+        # ── Q projection + split into num_heads: [B, H, num_q, head_dim]
+        q = self.q_proj(query.permute(1, 0, 2))           # [B, num_q, D]
+        q = q.view(B, num_q, H, head_dim).permute(0, 2, 1, 3)  # [B, H, num_q, head_dim]
 
-        accum = torch.zeros_like(q)
+        accum = torch.zeros(B, num_q, self.embed_dims, device=query.device, dtype=query.dtype)
         count = torch.zeros(B, num_q, 1, device=query.device, dtype=query.dtype)
         if _bv.DEBUG_PRINTS:
             print(f"[SMCA] queries_visible_any_cam={valid.any(dim=-1).float().mean():.3f}")
@@ -1037,33 +1034,37 @@ class SMCACrossAtten(BaseModule):
             _bv.store_smca_gauss(
                 [gauss_topk[:, ci, :] for ci in range(self.num_cams)], H0, W0)
 
+        # for each camera image
         for cam_idx in range(self.num_cams):
             cam_feat = img_feat[:, cam_idx]  # [B, D, H0, W0]
-            # flatten spatial → [B, H0*W0, D]
-            kv_flat = cam_feat.flatten(2).permute(0, 2, 1)
-            k = self.k_proj(kv_flat)  # [B, H0*W0, D]
-            v = self.v_proj(kv_flat)
+            kv_flat = cam_feat.flatten(2).permute(0, 2, 1)  # [B, H0*W0, D]
 
-            # raw attention logits [B, num_q, H0*W0]
-            attn = torch.bmm(q, k.transpose(1, 2)) * self.scale
+            # K, V split into heads: [B, H, H0*W0, head_dim]
+            k = self.k_proj(kv_flat).view(B, H0 * W0, H, head_dim).permute(0, 2, 1, 3)
+            v = self.v_proj(kv_flat).view(B, H0 * W0, H, head_dim).permute(0, 2, 1, 3)
 
-            # add log-Gaussian mask (in log domain = additive bias)
-            g = gauss[:, :, cam_idx, :]  # [B, num_q, H0*W0]
-            attn = attn + torch.log(g.clamp(min=1e-6))
+            # attention logits [B, H, num_q, H0*W0]
+            attn = torch.matmul(q, k.transpose(-1, -2)) * self.scale
 
-            attn = attn.softmax(dim=-1)  # [B, num_q, H0*W0]
+            # add log-Gaussian as additive mask before softmax (same as TransFusion)
+            g = gauss[:, :, cam_idx, :].unsqueeze(1)  # [B, 1, num_q, H0*W0]
+            attn = attn + g.clamp(min=1e-6).log()      # log-additive: softmax(Q·Kᵀ + log G)
+
+            attn = attn.softmax(dim=-1)  # [B, H, num_q, H0*W0]
 
             if cam_idx == 0 and _bv.DEBUG_PRINTS:
-                max_ent = torch.log(torch.tensor(attn.shape[-1], dtype=attn.dtype, device=attn.device))
-                entropy = -(attn * attn.clamp(1e-10).log()).sum(-1).mean() / max_ent
+                attn_vis = attn.mean(dim=1)  # [B, num_q, H0*W0] — already normalized
+                max_ent = torch.log(torch.tensor(attn_vis.shape[-1], dtype=attn_vis.dtype, device=attn_vis.device))
+                entropy = -(attn_vis * attn_vis.clamp(1e-10).log()).sum(-1).mean() / max_ent
                 print(f"[SMCA cam0] attn_entropy_norm={entropy.item():.3f}  (0=focused, 1=uniform)")
 
             if _do_vis:
                 idx = _bv._top_q_idx.to(attn.device)
-                _attn_collect.append(attn[0, idx, :])  # [K, H0*W0]
+                _attn_collect.append(attn[0].mean(dim=0)[idx, :])  # [K, H0*W0]
 
-            # weighted sum of values [B, num_q, D]
-            out = torch.bmm(attn, v)
+            # weighted sum of values → merge heads: [B, num_q, D]
+            out = torch.matmul(attn, v)                              # [B, H, num_q, head_dim]
+            out = out.permute(0, 2, 1, 3).reshape(B, num_q, self.embed_dims)
 
             # mask invalid projections
             cam_valid = valid[:, :, cam_idx].float().unsqueeze(-1)  # [B, num_q, 1]
@@ -1084,11 +1085,11 @@ class SMCACrossAtten(BaseModule):
         # back to [num_q, B, D]
         out = accum.permute(1, 0, 2)
         pos_feat = pos_feat.permute(1, 0, 2)
-        
-        # after Layer 0 puts the query out of scope of all cameras, return mask to indicate which queries have no valid camera view
-        no_cam_mask = (count.squeeze(-1) == 0)  # [B, num_q]  True
+
+        no_cam_mask = (count.squeeze(-1) == 0)  # [B, num_q]
         if _bv.DEBUG_PRINTS:
             print(f"[SMCA] no_cam_mask_rate={no_cam_mask.float().mean():.3f}  (0=all visible, 1=none)")
+
         return self.dropout(out) + inp_residual + pos_feat, no_cam_mask
 
 

@@ -432,29 +432,59 @@ def main():
                         help='path of preprocessed gt boxes in JSON format')
     parser.add_argument('--config', default=None,
                         help='mmdet3d config file; reads prediction_eval_classes and class_names from it')
-    parser.add_argument('--nusc_dataroot', default=None,  # LiViP add
+    parser.add_argument('--nusc_dataroot', default=None,
                         help='NuScenes dataroot; if set, filters GT to camera-visible objects only')
-    parser.add_argument('--nusc_version', default='v1.0-trainval')  # LiViP add
+    parser.add_argument('--nusc_version', default='v1.0-trainval')
+    parser.add_argument('--per_class', action='store_true',
+                        help='run evaluation separately for each class and print a summary table')
     args = parser.parse_args()
 
-    class_indices = None
-    eval_class_names = None
+    all_classes = ['car', 'truck', 'bus', 'trailer', 'motorcycle', 'bicycle', 'pedestrian']
+    eval_classes = all_classes
     if args.config is not None:
         model_cfg = mmcv.Config.fromfile(args.config)
-        all_classes = model_cfg.get('class_names', [])
+        all_classes = model_cfg.get('class_names', all_classes)
         eval_classes = model_cfg.get('prediction_eval_classes', all_classes)
+
+    if args.per_class:
+        print(f'\n{"="*60}')
+        print(f'Per-class prediction evaluation')
+        print(f'{"="*60}')
+        per_class_results = {}
+        for cls in eval_classes:
+            if cls not in all_classes:
+                continue
+            idx = {all_classes.index(cls)}
+            nusc_eval = PredictionEval(result_path=args.result_path,
+                                       prediction_infos_path=args.prediction_infos_path,
+                                       nusc_dataroot=args.nusc_dataroot,
+                                       nusc_version=args.nusc_version,
+                                       class_indices=idx)
+            nusc_eval._eval_class_names = {cls}
+            metrics = nusc_eval.evaluate()
+            per_class_results[cls] = metrics.serialize()
+
+        # save and print summary table
+        out_path = os.path.join(os.path.dirname(args.result_path), 'prediction_metrics_per_class.json')
+        with open(out_path, 'w') as f:
+            json.dump(per_class_results, f, indent=4)
+
+        print(f'\n{"Class":<12} {"minADE":>8} {"minFDE":>8} {"MR":>7} {"EPA":>7}')
+        print('-' * 47)
+        for cls, m in per_class_results.items():
+            print(f'{cls:<12} {m["minADE"]:>8.3f} {m["minFDE"]:>8.3f} '
+                  f'{m["MR"]:>7.3f} {m["EPA"]:>7.3f}')
+        print(f'\nSaved to {out_path}')
+    else:
         class_indices = {all_classes.index(c) for c in eval_classes if c in all_classes}
-        eval_class_names = set(eval_classes)
         print(f'Evaluating on classes: {eval_classes}')
-
-    nusc_eval = PredictionEval(result_path=args.result_path,
-                               prediction_infos_path=args.prediction_infos_path,
-                               nusc_dataroot=args.nusc_dataroot,
-                               nusc_version=args.nusc_version,
-                               class_indices=class_indices)
-    nusc_eval._eval_class_names = eval_class_names
-
-    nusc_eval.main()
+        nusc_eval = PredictionEval(result_path=args.result_path,
+                                   prediction_infos_path=args.prediction_infos_path,
+                                   nusc_dataroot=args.nusc_dataroot,
+                                   nusc_version=args.nusc_version,
+                                   class_indices=class_indices)
+        nusc_eval._eval_class_names = set(eval_classes)
+        nusc_eval.main()
 
 
 if __name__ == '__main__':

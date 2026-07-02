@@ -7,6 +7,14 @@ OTAZKY KU 26.5. 2026
 1. Gradients diminishing?
 2. SCORE analysis
 python tools/score_analysis.py work_dirs/livip3d_resnet50_3cam/results_nusc.json
+3. current problem different hyperparms, score_threshold...?
+ep12:
+{
+    "minADE": 1.361519587051659,
+    "minFDE": 2.3776537195614558,
+    "MR": 0.2915388778639726,
+    "EPA": 0.1365115115115115
+} possible error<->epa tradeoff, augmented dataset needed because of the heatmap generates topk over all classes
 
 PYTHONPATH=. python tools/train.py plugin/vip3d/configs/livip3d_resnet50_lidar_img_guided.py \
     --work-dir work_dirs/livip3d_lidar_img_guided
