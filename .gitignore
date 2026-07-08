@@ -6,3 +6,4 @@ data
 *.pth
 runs
 prof_trace
+thrash

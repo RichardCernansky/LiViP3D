@@ -2,7 +2,7 @@
 set -e
 
 CONFIG=plugin/vip3d/configs/livip3d_resnet50_lidar_img_guided_smca.py
-WORK_DIR=work_dirs/livip3d_lidar_img_guided_smca
+WORK_DIR=work_dirs/livip3d_lidar_img_guided_smca_3ep
 
 for CKPT_NAME in epoch_3; do
     CKPT=${WORK_DIR}/${CKPT_NAME}.pth
