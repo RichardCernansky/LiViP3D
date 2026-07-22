@@ -1,7 +1,17 @@
 _base_ = [
-    './_base_/nus-3d.py',
-    './_base_/default_runtime.py'
+    '../_base_/nus-3d.py',
+    '../_base_/default_runtime.py'
 ]
+# TransFusion Table 7 ablation, full-model cell: image-guided query init
+# AND SMCA feature fusion both ON. Stage 2 of the paper's true 2-stage
+# scheme -- loads directly from stage 1's
+# (augmented/livip3d_resnet50_lidar_only.py) finished checkpoint, sibling
+# to livip3d_resnet50_lidar_img_guided.py ("w/o Fusion") and
+# livip3d_resnet50_lidar_fusion_only.py ("w/o Guide"). No point-cloud
+# geometric augmentation: both img-guided init and SMCA rely on
+# calibration matrices computed once before the pipeline runs (see
+# dataset.py get_data_info), so LiDAR-side flip/rotate/scale would desync
+# LiDAR geometry from the (unaugmented) camera images this stage fuses.
 workflow = [('train', 1)]
 plugin = True
 plugin_dir = 'plugin/'
@@ -40,7 +50,7 @@ model = dict(
         max_num=100,
         num_classes=7),
     fix_feats=True,   # camera backbone frozen — img guided uses frozen features
-    fix_lidar=True,
+    fix_lidar=True,   # stage 1 LiDAR backbone already converged; only train new modules
     score_thresh=0.4,
     filter_score_thresh=0.35,
     use_lidar=True,
@@ -169,7 +179,7 @@ model = dict(
             normalize=True,
             offset=-0.5),
     ),
-    debug=True,
+    debug=False,
     bev_vis=True,
     vis_interval=20,
     use_img_guided=True,
@@ -341,5 +351,5 @@ evaluation = dict(interval=6)
 runner = dict(type='EpochBasedRunner', max_epochs=6)
 
 find_unused_parameters = True
-load_from = 'work_dirs/s2-livip3d_lidar_img_guided/epoch_10.pth'
+load_from = 'work_dirs/augmented/s1-lidar_only/epoch_20.pth'
 # fp16 = dict(loss_scale='dynamic')

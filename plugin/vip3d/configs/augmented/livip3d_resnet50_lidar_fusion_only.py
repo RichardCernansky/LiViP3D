@@ -1,7 +1,16 @@
 _base_ = [
-    './_base_/nus-3d.py',
-    './_base_/default_runtime.py'
+    '../_base_/nus-3d.py',
+    '../_base_/default_runtime.py'
 ]
+# TransFusion Table 7 ablation, "w/o Guide" cell: SMCA feature fusion ON,
+# image-guided query init OFF. Stage 2 of the paper's 2-stage scheme --
+# loads directly from stage 1's (augmented/livip3d_resnet50_lidar_only.py)
+# finished checkpoint, sibling to livip3d_resnet50_lidar_img_guided.py
+# ("w/o Fusion") and livip3d_resnet50_lidar_img_guided_smca.py (full
+# model). No point-cloud geometric augmentation here, same reasoning as
+# the other two stage-2 configs: SMCA's cross attention is keyed off
+# projected query centers using calibration matrices that augmentation
+# would desync from the (unaugmented) camera images.
 workflow = [('train', 1)]
 plugin = True
 plugin_dir = 'plugin/'
@@ -39,8 +48,8 @@ model = dict(
         pc_range=[-51.2, -51.2, -5.0, 51.2, 51.2, 3.0],
         max_num=100,
         num_classes=7),
-    fix_feats=True,   # camera backbone frozen — img guided uses frozen features
-    fix_lidar=True,
+    fix_feats=True,   # camera backbone frozen
+    fix_lidar=True,   # stage 1 LiDAR backbone already converged; only train new modules
     score_thresh=0.4,
     filter_score_thresh=0.35,
     use_lidar=True,
@@ -169,10 +178,10 @@ model = dict(
             normalize=True,
             offset=-0.5),
     ),
-    debug=True,
+    debug=False,
     bev_vis=True,
     vis_interval=20,
-    use_img_guided=True,
+    use_img_guided=False,
     use_smca=True,
     do_pred=True,
     relative_pred=True,
@@ -324,7 +333,7 @@ optimizer = dict(
             'hm_task2':    dict(lr_mult=0.1),
             'hm_task4':    dict(lr_mult=0.1),
             'hm_task5':    dict(lr_mult=0.1),
-            # img_bev_proj and img_hm_* use base lr (2e-4) — new modules, full lr
+            # smca_attn and other new fusion modules use base lr (2e-4)
         }),
     weight_decay=0.01)
 optimizer_config = dict(grad_clip=dict(max_norm=35, norm_type=2))
@@ -341,5 +350,5 @@ evaluation = dict(interval=6)
 runner = dict(type='EpochBasedRunner', max_epochs=6)
 
 find_unused_parameters = True
-load_from = 'work_dirs/s2-livip3d_lidar_img_guided/epoch_10.pth'
+load_from = 'work_dirs/s1-livip3d_lidar_only_augmented/epoch_20.pth'
 # fp16 = dict(loss_scale='dynamic')

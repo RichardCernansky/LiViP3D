@@ -6,6 +6,8 @@ from mmdet3d.core.points import BasePoints
 from mmdet.datasets.builder import PIPELINES
 from mmdet.datasets.pipelines import to_tensor
 from mmdet3d.datasets.pipelines import DefaultFormatBundle
+from mmdet3d.datasets.pipelines import (GlobalRotScaleTrans, RandomFlip3D,
+                                        ObjectSample)
 import mmcv
 from nuscenes.utils.data_classes import RadarPointCloud
 
@@ -145,6 +147,215 @@ class InstanceRangeFilter(object):
         repr_str = self.__class__.__name__
         repr_str += f'(point_cloud_range={self.pcd_range.tolist()})'
         return repr_str
+
+
+@PIPELINES.register_module()
+class TrackConsistentGlobalRotScaleTrans(GlobalRotScaleTrans):
+    """GlobalRotScaleTrans that reuses one random draw across every frame
+    of a training sample.
+
+    NuScenesTrackDatasetRadar.prepare_train_data runs pipeline_single
+    independently per frame of the multi-frame tracking window. Drawing a
+    fresh random rotation/scale per frame would desync object positions
+    across the window, which the QIM/memory-bank tracking head assumes are
+    coherent. `input_dict['aug_state']` is a dict shared by the caller
+    across all frames of one sample: the first frame draws and caches the
+    values, later frames reuse them.
+    """
+
+    def _random_scale(self, input_dict):
+        aug_state = input_dict.get('aug_state')
+        if aug_state is not None and 'pcd_scale_factor' in aug_state:
+            input_dict['pcd_scale_factor'] = aug_state['pcd_scale_factor']
+            return
+        super()._random_scale(input_dict)
+        if aug_state is not None:
+            aug_state['pcd_scale_factor'] = input_dict['pcd_scale_factor']
+
+    def _rot_bbox_points(self, input_dict):
+        aug_state = input_dict.get('aug_state')
+        if aug_state is not None and 'noise_rotation' in aug_state:
+            noise_rotation = aug_state['noise_rotation']
+        else:
+            noise_rotation = np.random.uniform(self.rot_range[0],
+                                               self.rot_range[1])
+            if aug_state is not None:
+                aug_state['noise_rotation'] = noise_rotation
+
+        if len(input_dict['bbox3d_fields']) == 0:
+            rot_mat_T = input_dict['points'].rotate(noise_rotation)
+            input_dict['pcd_rotation'] = rot_mat_T
+            return
+
+        for key in input_dict['bbox3d_fields']:
+            if len(input_dict[key].tensor) != 0:
+                points, rot_mat_T = input_dict[key].rotate(
+                    noise_rotation, input_dict['points'])
+                input_dict['points'] = points
+                input_dict['pcd_rotation'] = rot_mat_T
+
+
+@PIPELINES.register_module()
+class TrackConsistentRandomFlip3D(RandomFlip3D):
+    """RandomFlip3D that reuses one random flip decision across every frame
+    of a training sample. See TrackConsistentGlobalRotScaleTrans for why.
+
+    Must be used with sync_2d=False since no image flip is coordinated
+    here (images aren't loaded in the LiDAR-only stage this is meant for).
+    """
+
+    def __call__(self, input_dict):
+        assert not self.sync_2d, \
+            'TrackConsistentRandomFlip3D requires sync_2d=False'
+        aug_state = input_dict.get('aug_state')
+        if aug_state is not None:
+            if 'pcd_horizontal_flip' in aug_state:
+                input_dict['pcd_horizontal_flip'] = aug_state[
+                    'pcd_horizontal_flip']
+            if 'pcd_vertical_flip' in aug_state:
+                input_dict['pcd_vertical_flip'] = aug_state[
+                    'pcd_vertical_flip']
+        result = super().__call__(input_dict)
+        if aug_state is not None:
+            aug_state.setdefault('pcd_horizontal_flip',
+                                 input_dict['pcd_horizontal_flip'])
+            aug_state.setdefault('pcd_vertical_flip',
+                                 input_dict['pcd_vertical_flip'])
+        return result
+
+
+@PIPELINES.register_module()
+class TrackConsistentObjectSample(ObjectSample):
+    """ObjectSample (copy-paste GT sampling) that replays the same pasted
+    objects, at the same local LiDAR-frame position, across every frame of
+    a training sample, and keeps `ann_info['instance_inds']` in sync with
+    them.
+
+    NuScenesTrackDatasetRadar reads `example['instance_inds']` from
+    `ann_info` after the pipeline runs (see prepare_train_data_single), so
+    a plain ObjectSample would silently desync gt_bboxes_3d/gt_labels_3d
+    (now longer) from instance_inds (still the pre-paste length) and crash
+    or misalign the tracking loss downstream.
+
+    Frame-independent pasting (drawing a fresh db_sampler call per frame)
+    would give each pasted object a lifetime of exactly one frame, so the
+    tracker only ever sees it as a one-off, never-continued detection --
+    never gets to practice continuing a track for it. Instead, the first
+    frame of the sample draws the paste once (db_sampler.sample_all) and
+    caches the sampled boxes/labels/points plus one shared instance id per
+    object into `input_dict['aug_state']`; later frames replay the exact
+    same objects at the exact same local coordinates (only re-removing
+    whichever real points happen to fall inside the box that frame, since
+    the real point cloud differs per frame). This does not compensate for
+    ego motion between frames, so a "static" pasted object effectively
+    moves in lockstep with the ego vehicle rather than staying fixed in
+    the world -- over nuScenes' 0.5s keyframe spacing that reads as "a
+    vehicle traveling alongside you," not as an obviously broken artifact,
+    and is a deliberate cost/accuracy trade-off vs. re-anchoring the paste
+    in world coordinates and re-projecting through each frame's ego pose.
+
+    The shared instance id is disjoint from real instance indices and from
+    the -1/-2 sentinels ClipMatcher already reserves for "unmatched"/
+    "false positive" tracks, so the tracker treats a pasted object as a
+    normal track: matched while it's "present" in the sample, then marked
+    disappeared once the sample ends (since the id never reappears in a
+    later sample).
+
+    Also supports being turned off at runtime (`enabled = False`) so an
+    epoch-based hook can implement the "fade" strategy: fade the GT
+    sampling out for the last few epochs of training since pasted objects
+    sit in physically implausible spots and can distort the real data
+    distribution if used for the whole schedule.
+    """
+
+    _next_sentinel = -1000
+    _cache_key = 'object_sample'
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.enabled = True
+
+    def _draw_and_cache(self, input_dict, aug_state):
+        gt_bboxes_3d = input_dict['gt_bboxes_3d']
+        gt_labels_3d = input_dict['gt_labels_3d']
+        sampled_dict = self.db_sampler.sample_all(
+            gt_bboxes_3d.tensor.numpy(), gt_labels_3d, img=None)
+
+        if sampled_dict is None:
+            if aug_state is not None:
+                aug_state[self._cache_key] = None
+            return None
+
+        # ~0.3% of gt_database entries have NaN vx/vy (no valid prev/next
+        # annotation to estimate velocity); normalize_bbox() passes them
+        # straight into the regression target and poisons the whole loss.
+        sampled_dict['gt_bboxes_3d'] = np.nan_to_num(
+            sampled_dict['gt_bboxes_3d'], nan=0.0)
+
+        n_sampled = len(sampled_dict['gt_labels_3d'])
+        sentinels = np.arange(
+            TrackConsistentObjectSample._next_sentinel,
+            TrackConsistentObjectSample._next_sentinel - n_sampled, -1)
+        TrackConsistentObjectSample._next_sentinel -= n_sampled
+
+        paste = dict(
+            gt_bboxes_3d=sampled_dict['gt_bboxes_3d'],
+            gt_labels_3d=sampled_dict['gt_labels_3d'],
+            points=sampled_dict['points'],
+            instance_sentinels=sentinels)
+        if aug_state is not None:
+            aug_state[self._cache_key] = dict(
+                gt_bboxes_3d=paste['gt_bboxes_3d'].copy(),
+                gt_labels_3d=paste['gt_labels_3d'].copy(),
+                points=sampled_dict['points'].clone(),
+                instance_sentinels=sentinels.copy())
+        return paste
+
+    def _apply_paste(self, input_dict, paste):
+        gt_bboxes_3d = input_dict['gt_bboxes_3d']
+        gt_labels_3d = input_dict['gt_labels_3d']
+        points = input_dict['points']
+
+        gt_labels_3d = np.concatenate(
+            [gt_labels_3d, paste['gt_labels_3d']], axis=0)
+        gt_bboxes_3d = gt_bboxes_3d.new_box(
+            np.concatenate(
+                [gt_bboxes_3d.tensor.numpy(), paste['gt_bboxes_3d']]))
+        points = self.remove_points_in_boxes(points, paste['gt_bboxes_3d'])
+        points = points.cat([paste['points'], points])
+
+        input_dict['gt_bboxes_3d'] = gt_bboxes_3d
+        input_dict['gt_labels_3d'] = gt_labels_3d.astype(np.long)
+        input_dict['points'] = points
+
+        if 'ann_info' in input_dict:
+            existing = input_dict['ann_info']['instance_inds']
+            input_dict['ann_info'] = dict(input_dict['ann_info'])
+            input_dict['ann_info']['instance_inds'] = np.concatenate(
+                [existing, paste['instance_sentinels'].astype(existing.dtype)])
+
+    def __call__(self, input_dict):
+        if not self.enabled:
+            return input_dict
+
+        aug_state = input_dict.get('aug_state')
+
+        if aug_state is not None and self._cache_key in aug_state:
+            cached = aug_state[self._cache_key]
+            if cached is None:
+                return input_dict
+            paste = dict(
+                gt_bboxes_3d=cached['gt_bboxes_3d'],
+                gt_labels_3d=cached['gt_labels_3d'],
+                points=cached['points'].clone(),
+                instance_sentinels=cached['instance_sentinels'])
+        else:
+            paste = self._draw_and_cache(input_dict, aug_state)
+            if paste is None:
+                return input_dict
+
+        self._apply_paste(input_dict, paste)
+        return input_dict
 
 
 @PIPELINES.register_module()

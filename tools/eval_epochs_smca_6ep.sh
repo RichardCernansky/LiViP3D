@@ -2,9 +2,9 @@
 set -e
 
 CONFIG=plugin/vip3d/configs/livip3d_resnet50_lidar_img_guided_smca.py
-WORK_DIR=work_dirs/livip3d_lidar_img_guided_smca_6ep
+WORK_DIR=work_dirs/s3-livip3d_lidar_img_guided_smca_6ep
 
-for EP in 6; do
+for EP in 3 4 5 6; do
     CKPT=${WORK_DIR}/epoch_${EP}.pth
     OUT_DIR=${WORK_DIR}/ep${EP}
 

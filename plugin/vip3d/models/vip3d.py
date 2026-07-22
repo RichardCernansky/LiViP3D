@@ -665,6 +665,7 @@ class ViP3D(MVXTwoStageDetector):
         # LiVip add end
 
         # always runs regardless of use_lidar
+   
         output_classes, output_coords, \
             query_feats, last_ref_pts = self.pts_bbox_head(
             img_feats, radar_feats, track_instances.query,
@@ -689,13 +690,16 @@ class ViP3D(MVXTwoStageDetector):
 
         # Step-1 Update track instances with current prediction
         # [nb_dec, bs, num_query, xxx]
-        nb_dec = output_classes.size(0)
+        nb_dec = output_classes.size(0)  # nb_dec = how many decoder layers = how many "cards" to grade
 
         # the track id will be assigned by the mather.
         # only copy matched_gt_idxes, obj_idxes, etc.
         track_instances_list = [self._copy_tracks_for_loss(track_instances) for i in range(nb_dec - 1)]
+        # ^ makes (nb_dec-1) disposable "practice cards" -- deep copies, only ID fields (obj_idxes etc)
         track_instances.output_embedding = query_feats[0]  # [300, feat_dim]
+        # ^ writes onto the REAL card (still just a loose var here, not in the list yet)
         velo = output_coords[-1, 0, :, -2:]  # [num_query, 3]
+        # ^ just READS the already-predicted vx,vy from the last layer's box -- not a new prediction
 
         if True:
             if l2g_r2 is not None:
@@ -705,28 +709,36 @@ class ViP3D(MVXTwoStageDetector):
             else:
                 ref_pts = last_ref_pts[0]
             track_instances.ref_pts = ref_pts
+            # ^ move REAL card's ref point into next frame's coordinates (skip if this is the last frame)
 
         # track_instances.query = torch.cat((track_instances.query[:, :self.embed_dims // 2],
         #   query_feats[0]), dim=1)
+        # ^ dead/commented-out, ignore
 
         track_instances_list.append(track_instances)
+        # ^ NOW the real card joins the list too: [practice card(s)..., REAL card] -- REAL card always LAST
         for i in range(nb_dec):
             track_instances = track_instances_list[i]
+            # ^ move the "current card" pointer to card i (last iteration = the REAL card)
             track_instances.scores = track_scores
             track_instances.pred_logits = output_classes[i, 0]  # [300, num_cls]
             track_instances.pred_boxes = output_coords[i, 0]  # [300, box_dim]
+            # ^ stamp THIS layer's predictions onto whichever card is currently pointed at
 
             # used keys in 'track_instances': 'pred_logits', 'pred_boxes', 'obj_idxes', 'matched_gt_idxes',
             # modified keys: 'matched_gt_idxes', 'obj_idxes'
             track_instances = self.criterion.match_for_single_frame(
                 track_instances, i, if_step=(i == (nb_dec - 1)))
+            # ^ grade this card vs GT (adds to loss), updates obj_idxes/matched_gt_idxes in place
 
         if self.memory_bank is not None:
             track_instances = self.memory_bank(track_instances)
+            # ^ pointer is left on the REAL card (last loop iter) -- blend in ITS OWN past memory only
 
         tmp = {}
         tmp['track_instances'] = track_instances
         out_track_instances = self.query_interact(tmp)  # see qim.py
+        # ^ refresh REAL card's query for next frame + drop dead slots -> this carries to frame+1
         return out_track_instances
 
     def forward_train(self,
@@ -834,15 +846,18 @@ class ViP3D(MVXTwoStageDetector):
 
         if True:
             # for bs 1
+            # extract lidar-image projection matrices for each frame; None if lidar-only
             lidar2img = img_metas[0]['lidar2img'] if img is not None else None  # [T, num_cam]; None for lidar-only
             for i in range(num_frame):
-                points_single = [p_[i] for p_ in points] if points is not None else None
 
+                # take out the i-th frame from full sequence; None if lidar-only
+                points_single = [p_[i] for p_ in points] if points is not None else None
                 img_single = torch.stack([img_[i] for img_ in img], dim=0) if img is not None else None  # None for lidar-only
                 radar_single = torch.stack([radar_[i] for radar_ in radar], dim=0) if radar is not None else None
 
                 img_metas_single = deepcopy(img_metas)
                 if lidar2img is not None:  # only set per-frame lidar2img when camera is active
+                    #img_metas[0]['lidar2img'][i] gives the [num_cam, 4, 4]
                     img_metas_single[0]['lidar2img'] = lidar2img[i]
 
                 if i == num_frame - 1:
@@ -917,7 +932,7 @@ class ViP3D(MVXTwoStageDetector):
                 for j in range(len(track_instances)):
                     # obj_idxes is obtained by matching
                     obj_id = track_instances.obj_idxes[j].item()
-                    if obj_id != -1 and obj_id != -2:
+                    if obj_id != -1 and obj_id != -2 and obj_id in instance_idx_2_labels:
                         def run(future_traj=None,
                                 future_traj_relative=None,
                                 future_traj_is_valid=None,

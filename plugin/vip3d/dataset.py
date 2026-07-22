@@ -263,7 +263,7 @@ class NuScenesTrackDatasetRadar(Dataset):
             point = point + translation
         return point
 
-    def prepare_data_history(self, start, end, interval):
+    def prepare_data_history(self, start, end, interval, aug_state=None):
         ret = None
         for i in range(start, end, interval):
             if not (0 <= i < len(self.data_infos)):
@@ -281,7 +281,7 @@ class NuScenesTrackDatasetRadar(Dataset):
                 range_filter(data_i)
                 data_i['instance_inds'] = data_i['ann_info']['instance_inds']
             else:
-                data_i = self.prepare_train_data_single(i)
+                data_i = self.prepare_train_data_single(i, aug_state=aug_state)
 
             if data_i is None:
                 return None
@@ -293,7 +293,7 @@ class NuScenesTrackDatasetRadar(Dataset):
                 ret[key].append(value)
         return ret
 
-    def get_pred_agents(self, results, start, end, interval, mapping, data_history=None):
+    def get_pred_agents(self, results, start, end, interval, mapping, data_history=None, aug_state=None):
         future_frame_num = 12
         past_frame_num = end - start
         instance_idx_2_labels = {}
@@ -307,7 +307,7 @@ class NuScenesTrackDatasetRadar(Dataset):
 
         same_scene = self.is_the_same_scene(start, end, future_frame_num)
 
-        data_history = self.prepare_data_history(start, end + future_frame_num, interval)
+        data_history = self.prepare_data_history(start, end + future_frame_num, interval, aug_state=aug_state)
 
         if same_scene and data_history is not None:
 
@@ -364,6 +364,8 @@ class NuScenesTrackDatasetRadar(Dataset):
 
                 for box_idx, instance_idx in enumerate(instance_inds):
                     assert instance_idx != -1
+                    if instance_idx < 0:  # pasted-object sentinel, not a real tracked instance
+                        continue
                     if instance_idx not in instance_idx_2_labels:
                         if i >= end:
                             continue
@@ -806,11 +808,16 @@ class NuScenesTrackDatasetRadar(Dataset):
             targets.append(targets_i)
         return images, targets
 
-    def prepare_train_data_single(self, index):
+    def prepare_train_data_single(self, index, aug_state=None):
         """Training data preparation.
 
         Args:
             index (int): Index for accessing the target data.
+            aug_state (dict, optional): Random augmentation parameters
+                (flip/rotation/scale) shared across every frame of the
+                current multi-frame sample, so track-consistent pipeline
+                transforms (see pipeline.py) can reuse the same draw
+                instead of desyncing object positions frame-to-frame.
 
         Returns:
             dict: Training data dict of the corresponding index.
@@ -819,6 +826,8 @@ class NuScenesTrackDatasetRadar(Dataset):
         if input_dict is None:
             return None
         self.pre_pipeline(input_dict)
+        if aug_state is not None:
+            input_dict['aug_state'] = aug_state
         example = self.pipeline_single(input_dict)
 
         example['instance_inds'] = example['ann_info']['instance_inds']
@@ -851,8 +860,9 @@ class NuScenesTrackDatasetRadar(Dataset):
         assert not self.test_mode
 
         ret = None
+        aug_state = {}
         for i in range(start, end, interval):
-            data_i = self.prepare_train_data_single(i)
+            data_i = self.prepare_train_data_single(i, aug_state=aug_state)
             if data_i is None:
                 return None
 
@@ -864,7 +874,7 @@ class NuScenesTrackDatasetRadar(Dataset):
 
         if self.do_pred:
             if True:
-                pred_data = self.prepare_pred(start, end, interval, index)
+                pred_data = self.prepare_pred(start, end, interval, index, aug_state=aug_state)
 
             ret.update(pred_data)
 
@@ -876,7 +886,7 @@ class NuScenesTrackDatasetRadar(Dataset):
 
         return ret
 
-    def prepare_pred(self, start, end, interval, index):
+    def prepare_pred(self, start, end, interval, index, aug_state=None):
         results = {}
         if not hasattr(self, 'nuscenes'):
             self.prepare_nuscenes()
@@ -885,7 +895,7 @@ class NuScenesTrackDatasetRadar(Dataset):
 
         mapping = {}
 
-        self.get_pred_agents(results, start, end, interval, mapping)
+        self.get_pred_agents(results, start, end, interval, mapping, aug_state=aug_state)
         self.get_pred_lanes(results, start, end, interval, mapping)
 
         info = self.data_infos[end - 1]

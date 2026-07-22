@@ -267,24 +267,29 @@ class ClipMatcher(nn.Module):
         obj_idxes = gt_instances_i.obj_ids
         obj_idxes_list = obj_idxes.detach().cpu().numpy().tolist()
         obj_idx_to_gt_idx = {obj_idx: gt_idx for gt_idx, obj_idx in enumerate(obj_idxes_list)}
+        # ^ lookup: persistent object ID -> which row of THIS frame's GT list it's at
         outputs_i = {
             'pred_logits': pred_logits_i.unsqueeze(0),
             'pred_boxes': pred_boxes_i.unsqueeze(0),
         }
+        # ^ repackaged for the loss functions, unused until step 8
 
         # step1. inherit and update the previous tracks.
-        num_disappear_track = 0
+        num_disappear_track = 0  # per-frame tally only, NOT a consecutive-occlusion counter
         for j in range(len(track_instances)):
             obj_id = track_instances.obj_idxes[j].item()
             # set new target idx.
             if obj_id >= 0:
                 if obj_id in obj_idx_to_gt_idx:
                     track_instances.matched_gt_idxes[j] = obj_idx_to_gt_idx[obj_id]
+                    # ^ still-alive track: record where its object sits in today's GT
                 else:
                     num_disappear_track += 1
                     track_instances.matched_gt_idxes[j] = -1  # track-disappear case.
+                    # ^ object gone this frame -- obj_id itself is NOT reset here
             else:
                 track_instances.matched_gt_idxes[j] = -1
+                # ^ empty slot, nothing to inherit (may get a NEW match below)
 
         full_track_idxes = torch.arange(len(track_instances), dtype=torch.long).to(pred_logits_i.device)
         # previsouly tracked, which is matched by rule
@@ -292,10 +297,12 @@ class ClipMatcher(nn.Module):
         prev_matched_indices = torch.stack(
             [full_track_idxes[matched_track_idxes], track_instances.matched_gt_idxes[matched_track_idxes]], dim=1).to(
             pred_logits_i.device)
+        # ^ (slot, gt_row) pairs for EVERY alive track -- includes disappeared ones (gt_row=-1)!
 
         # step2. select the unmatched slots.
         # note that the FP tracks whose obj_idxes are -2 will not be selected here.
         unmatched_track_idxes = full_track_idxes[track_instances.obj_idxes == -1]
+        # ^ empty slots = candidates for a brand NEW track to be born into
 
         # step3. select the untracked gt instances (new tracks).
         # untracked means tgt_state is 0
@@ -310,6 +317,7 @@ class ClipMatcher(nn.Module):
         # untracked_tgt_indexes = select_unmatched_indexes(tgt_indexes, len(gt_instances_i))
         # [num_untracked]
         untracked_gt_instances = gt_instances_i[untracked_tgt_indexes]
+        # ^ real objects THIS frame that nobody is currently tracking yet -- new or reappeared
 
         def match_for_single_decoder_layer(unmatched_outputs, matcher):
             bbox_preds, cls_preds = unmatched_outputs['pred_boxes'], unmatched_outputs['pred_logits']
@@ -328,11 +336,13 @@ class ClipMatcher(nn.Module):
             cls_pred = cls_preds[0]
 
             src_idx, tgt_idx = matcher.assign(bbox_pred, cls_pred, gt_bboxes, gt_labels)
+            # ^ Hungarian matching: empty slots <-> untracked GT, by class+box cost
             if src_idx is None:
                 return None
             # concat src and tgt.
             new_matched_indices = torch.stack([unmatched_track_idxes[src_idx], untracked_tgt_indexes[tgt_idx]],
                                               dim=1).to(pred_logits_i.device)
+            # ^ translate back from "local" indices to real slot/gt-row indices
             return new_matched_indices
 
         # step4. do matching between the unmatched slots and GTs.
@@ -348,29 +358,36 @@ class ClipMatcher(nn.Module):
         # step5. update obj_idxes according to the new matching result.
         if new_matched_indices is not None:
             track_instances.obj_idxes[new_matched_indices[:, 0]] = gt_instances_i.obj_ids[new_matched_indices[:, 1]].long()
+            # ^ TRACK BIRTH: slot permanently stamped with the real object's persistent ID
             track_instances.matched_gt_idxes[new_matched_indices[:, 0]] = new_matched_indices[:, 1]
 
             # step7. merge the unmatched pairs and the matched pairs.
             # [num_new_macthed + num_prev_mathed, 2]
             matched_indices = torch.cat([new_matched_indices, prev_matched_indices], dim=0)
+            # ^ THE FULL SET going into the loss: newly-born + inherited (incl. disappeared, gt_row=-1)
         else:
             matched_indices = prev_matched_indices
 
         # step8. calculate losses.
         self.num_samples += len(gt_instances_i) + num_disappear_track
+        # ^ bookkeeping only, used later to normalize the summed loss across the whole clip
         self.sample_device = pred_logits_i.device
 
-        for loss in self.losses:
+        for loss in self.losses:  # ['labels', 'boxes']
             new_track_loss = self.get_loss(loss,
                                            outputs=outputs_i,
                                            gt_instances=[gt_instances_i],
                                            indices=[(matched_indices[:, 0], matched_indices[:, 1])],
                                            )
+            # ^^^ THIS is where the loss actually gets computed for this frame/this decoder layer
+            # loss_labels: gt_row=-1 -> train slot to predict "background"
+            # loss_boxes:  gt_row=-1 -> SKIPPED entirely (no real box to regress against)
             self.losses_dict.update(
                 {'frame_{}_{}_{}'.format(self._current_frame_idx, key, dec_lvl): value for key, value in new_track_loss.items()})
+            # ^ stashed as e.g. "frame_1_loss_cls_0" -- per frame, per loss type, per decoder layer
 
         if if_step:
-            self._step()
+            self._step()  # self._current_frame_idx += 1 -- only on the LAST decoder layer's call
         return track_instances
 
     def forward(self, outputs, input_data: dict):
