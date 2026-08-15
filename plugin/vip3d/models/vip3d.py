@@ -23,6 +23,7 @@ from ...mmdet3d_plugin.models.utils.grid_mask import GridMask
 from .attention_dert3d import inverse_sigmoid
 from . import predictor_lib
 from .memory_bank import build_memory_bank
+from .apr import compute_apr_loss
 from .qim import build_qim
 from .radar_encoder import build_radar_encoder
 from .bev_vis import visualize_bev
@@ -154,6 +155,7 @@ class ViP3D(MVXTwoStageDetector):
                  bbox_coder=None,
                  qim_args=None,
                  mem_cfg=None,
+                 apr_cfg=None,
                  radar_encoder=None,
                  fix_feats=False,
                  fix_lidar=False,
@@ -189,6 +191,21 @@ class ViP3D(MVXTwoStageDetector):
                  use_img_guided=False,
                  use_smca=False,
                  ):
+        # apr_cfg stays a plain top-level model.apr_cfg entry in the config file (same
+        # spot as mem_cfg) even though the module itself is built and owned inside
+        # TransFusionTransformerDecoder — thread it into the nested config here, once,
+        # before super().__init__() builds pts_bbox_head (and everything under it)
+        # from this dict.
+        if apr_cfg is not None and use_lidar and pts_bbox_head is not None:
+            _pc_range = bbox_coder.get('pc_range') if bbox_coder else None
+            pts_bbox_head = dict(pts_bbox_head)
+            transformer_cfg = dict(pts_bbox_head.get('transformer', {}))
+            decoder_cfg = dict(transformer_cfg.get('decoder', {}))
+            decoder_cfg['apr_cfg'] = apr_cfg
+            decoder_cfg['pc_range'] = _pc_range
+            transformer_cfg['decoder'] = decoder_cfg
+            pts_bbox_head['transformer'] = transformer_cfg
+
         super(ViP3D,
               self).__init__(pts_voxel_layer, pts_voxel_encoder,
                              pts_middle_encoder, pts_fusion_layer,
@@ -298,6 +315,7 @@ class ViP3D(MVXTwoStageDetector):
             dim_out=embed_dims,
         )
         self.mem_bank_len = 0 if self.memory_bank is None else self.memory_bank.max_his_length
+
         self.criterion = build_loss(loss_cfg)
         self.test_track_instances = None
         self.l2g_r_mat = None
@@ -665,18 +683,44 @@ class ViP3D(MVXTwoStageDetector):
         # LiVip add end
 
         # always runs regardless of use_lidar
-   
+
+        # APR (if configured on the decoder) verifies continuing tracks' claimed recent
+        # past against buffered BEV evidence, once before each of the decoder's 2
+        # layers. It lives entirely inside TransFusionTransformerDecoder now — this
+        # just hands through the few per-frame values only ViP3D/track_instances has:
+        # who's alive, last known velocity, and this frame's own ego pose.
         output_classes, output_coords, \
             query_feats, last_ref_pts = self.pts_bbox_head(
             img_feats, radar_feats, track_instances.query,
             track_instances.ref_pts, ref_box_sizes, img_metas,
-            bev_feat=bev_feat if (self.use_lidar and pts_feats is not None) else None)
+            bev_feat=bev_feat if (self.use_lidar and pts_feats is not None) else None,
+            alive_mask=track_instances.obj_idxes >= 0,
+            velocity=track_instances.pred_boxes[:, -2:],
+            cur_ego_r=l2g_r1, cur_ego_t=l2g_t1, time_delta=time_delta)
 
         # SMCA attention visualisation (runs after pts_bbox_head so attn is collected)
         if self.use_lidar and pts_feats is not None:
             from .bev_vis import visualize_train_smca as _vis_smca, visualize_smca_gauss as _vis_gauss
             _vis_smca(heatmap, img)
             _vis_gauss(img)
+
+        # APR loss — obj_idxes is still "alive as of previous frame" here; this
+        # frame's own Hungarian match (below) hasn't touched it yet.
+        _decoder = getattr(self.pts_bbox_head, 'transformer', None)
+        _decoder = getattr(_decoder, 'decoder', None) if _decoder is not None else None
+        if _decoder is not None and getattr(_decoder, 'apr', None) is not None:
+            frame_idx = self.criterion._current_frame_idx
+            apr_loss = compute_apr_loss(
+                _decoder, self.criterion.gt_instances,
+                frame_idx, track_instances.obj_idxes)
+            if apr_loss is None:
+                # Nothing to supervise this frame on this rank (e.g. no alive
+                # tracks, or none matched real past GT) — data-dependent, so
+                # it varies independently per GPU. Log a zero instead of
+                # skipping the key: DDP's loss reduction requires every rank
+                # to report the exact same set of keys every iteration.
+                apr_loss = track_instances.pred_boxes.new_zeros(())
+            self.criterion.losses_dict[f'frame_{frame_idx}_apr_loss'] = apr_loss
 
         if self.add_branch:
             self.update_history_img_list(img_metas, img, img_feats)
@@ -836,6 +880,10 @@ class ViP3D(MVXTwoStageDetector):
 
         # reset call at the start of each training sample
         self.criterion.initialize_for_single_clip(gt_instances_list)
+        if hasattr(self.pts_bbox_head, 'transformer') and \
+                hasattr(self.pts_bbox_head.transformer, 'decoder') and \
+                hasattr(self.pts_bbox_head.transformer.decoder, 'reset_apr_history'):
+            self.pts_bbox_head.transformer.decoder.reset_apr_history()
 
         others_dict = {}
         mapping = None

@@ -268,7 +268,9 @@ class TransFusionDetHead(DeformableDETR3DCamHeadTrackPlusRaw):
     """
 
     def forward(self, mlvl_feats, radar_feats, query_embeds, ref_points,
-                ref_size, img_metas, bev_feat=None, petr_feature=False):
+                ref_size, img_metas, bev_feat=None, petr_feature=False,
+                alive_mask=None, velocity=None,
+                cur_ego_r=None, cur_ego_t=None, time_delta=None):
         
         # positional encoding on multi-level image features (skipped for lidar-only)
         if mlvl_feats is not None:
@@ -303,6 +305,8 @@ class TransFusionDetHead(DeformableDETR3DCamHeadTrackPlusRaw):
             img_metas=img_metas,
             radar_feats=radar_feats,
             bev_feat=bev_feat,          # <-- only addition vs. parent
+            alive_mask=alive_mask, velocity=velocity,
+            cur_ego_r=cur_ego_r, cur_ego_t=cur_ego_t, time_delta=time_delta,
         )
 
         hs = hs.permute(0, 2, 1, 3)    # [num_dec, B, num_q, D]
