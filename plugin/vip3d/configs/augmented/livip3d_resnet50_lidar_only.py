@@ -209,16 +209,22 @@ dataset_type = 'NuScenesTrackDatasetRadar'
 data_root = 'data/nuscenes/'
 file_client_args = dict(backend='disk')
 
-# GT sampling ("copy-paste") database, matching the sweep count used by
-# LoadPointsFromMultiSweeps below. Sample rates/min-points follow
-# CenterPoint's nuScenes recipe (the augmentation TransFusion says it
-# reuses for this stage), restricted to this model's 7 classes.
+# GT sampling ("copy-paste") database. Each sampled object carries its own
+# real multi-frame trajectory (built by tools/create_temporal_gt_database.py
+# from consecutive real keyframes of that object in its source scene) rather
+# than a single frozen snapshot, so TrackConsistentObjectSample can replay
+# its real recorded motion instead of assuming it or fabricating a constant
+# (see TemporalDataBaseSampler / TrackConsistentObjectSample in
+# plugin/vip3d/pipeline.py). Sample rates/min-points follow CenterPoint's
+# nuScenes recipe (the augmentation TransFusion says it reuses for this
+# stage), restricted to this model's 7 classes.
 db_sampler = dict(
+    type='TemporalDataBaseSampler',
     data_root=data_root,
-    info_path=data_root + 'nuscenes_dbinfos_10sweeps_withvelo.pkl',
+    info_path=data_root + 'nuscenes_dbinfos_temporal_10sweeps_withvelo.pkl',
     rate=1.0,
-    # nuscenes_dbinfos_10sweeps_withvelo.pkl has no KITTI-style 'difficulty'
-    # field, so only filter by point count.
+    # nuscenes_dbinfos_temporal_10sweeps_withvelo.pkl has no KITTI-style
+    # 'difficulty' field, so only filter by point count.
     prepare=dict(
         filter_by_min_points=dict(
             car=5, truck=5, bus=5, trailer=5,
@@ -261,6 +267,11 @@ train_pipeline = [
         sync_2d=False,
         flip_ratio_bev_horizontal=0.5,
         flip_ratio_bev_vertical=0.5),
+    # Must follow every geometric augmentation above: those rewrite points
+    # and boxes in local coordinates, and the ego pose has to be re-expressed
+    # to match or the tracker's frame-to-frame propagation is fed a pose
+    # describing the pre-augmentation scene.
+    dict(type='SyncEgoPoseToAugmentation'),
     dict(type='InstanceRangeFilter', point_cloud_range=point_cloud_range),
 ]
 train_pipeline_post = [

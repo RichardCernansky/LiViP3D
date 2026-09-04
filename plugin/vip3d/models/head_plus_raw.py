@@ -139,7 +139,9 @@ class DeformableDETR3DCamHeadTrackPlusRaw(nn.Module):
 
     # @auto_fp16(apply_to=('img', 'radar'))
     def forward(self, mlvl_feats, radar_feats,
-                query_embeds, ref_points, ref_size, img_metas, bev_feat=None, petr_feature=False):
+                query_embeds, ref_points, ref_size, img_metas, bev_feat=None, petr_feature=False,
+                alive_mask=None, velocity=None,
+                cur_ego_r=None, cur_ego_t=None, time_delta=None):
         """Forward function.
         Args:
             mlvl_feats (tuple[Tensor]): List of Features from the upstream

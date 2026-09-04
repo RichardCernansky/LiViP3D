@@ -3,6 +3,10 @@ Stage 1 (use_camera=False, fix_feats=True)
 Stage 2 — when ready, flip back
 test <6 cameras
 
+Otazky 24.8.26
+zacat spisovat nejako experimenty
+ako enhancnut? pocet layers?
+
 OTAZKY KU 26.5. 2026
 1. Gradients diminishing?
 2. SCORE analysis

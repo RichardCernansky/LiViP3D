@@ -6,7 +6,6 @@ from mmcv.runner.base_module import BaseModule
 from mmcv.cnn.bricks.registry import TRANSFORMER_LAYER_SEQUENCE
 from mmcv.cnn.bricks.transformer import TransformerLayerSequence
 from mmdet.models.utils.builder import TRANSFORMER
-from .apr import build_apr
 
 
 def inverse_sigmoid(x, eps=1e-5):
@@ -390,7 +389,7 @@ class TransFusionTransformerDecoder(BaseModule):
 
     def __init__(self, embed_dims=256, num_heads=8, ffn_dims=512, dropout=0.1,
                  lidar_bev_attn=None, smca_attn=None, use_smca=False,
-                 apr_cfg=None, pc_range=None, **kwargs):
+                 pc_range=None, **kwargs):
         super(TransFusionTransformerDecoder, self).__init__()
         from mmcv.cnn.bricks.registry import ATTENTION as ATT_REG
         self.embed_dims = embed_dims
@@ -413,60 +412,7 @@ class TransFusionTransformerDecoder(BaseModule):
             nn.Linear(ffn_dims, embed_dims), nn.Dropout(dropout))
         self.n1 = nn.ModuleList([nn.LayerNorm(embed_dims) for _ in range(3)])
 
-        # ── APR: owns its own module + its own rolling history of past BEV/ego-pose.
-        # Called once before layer 0 and, when SMCA is active, again before layer 1
-        # (using layer 0's already-refined position and content). vip3d.py hands in
-        # only the few per-frame values it alone has access to (track_instances-level
-        # state and the dataloader's ego pose) — everything else lives here.
-        self.apr = build_apr(apr_cfg, embed_dims)
         self.pc_range = pc_range
-        self.history_bev_feats = []
-        self.history_ego_r = []
-        self.history_ego_t = []
-        # last-computed APR outputs, one slot per call site this frame, keyed 'l0'/'l1' —
-        # for the APR loss (computed later in ViP3D, once GT is in scope) to read back.
-        # Each value is {'info': <apr forward()'s info dict>, 'alive_mask': [num_q] bool}.
-        self.last_apr = {}
-
-    def reset_apr_history(self):
-        self.history_bev_feats = []
-        self.history_ego_r = []
-        self.history_ego_t = []
-        self.last_apr = {}
-
-    def _push_apr_history(self, bev_feat, cur_ego_r, cur_ego_t):
-        if self.apr is None or bev_feat is None or cur_ego_r is None:
-            return
-        self.history_bev_feats.append(bev_feat.detach())
-        self.history_ego_r.append(cur_ego_r.detach())
-        self.history_ego_t.append(cur_ego_t.detach())
-        max_len = self.apr.history_len
-        self.history_bev_feats = self.history_bev_feats[-max_len:]
-        self.history_ego_r = self.history_ego_r[-max_len:]
-        self.history_ego_t = self.history_ego_t[-max_len:]
-
-    def _run_apr(self, q, reference_points, alive_mask, velocity,
-                 cur_ego_r, cur_ego_t, time_delta, tag):
-        """Refine q's content using APR, if enabled and there's something to refine.
-        q: [num_q, B, D] (B always 1 here). reference_points: [B, num_q, 3].
-        Only alive tracks are touched; everything else in q passes through
-        unchanged, and reference_points itself is never modified.
-        tag: 'l0' or 'l1' — which call site this is, so both can be told apart later.
-        """
-        if self.apr is None or alive_mask is None or not alive_mask.any() \
-                or len(self.history_bev_feats) == 0:
-            self.last_apr.pop(tag, None)
-            return q
-        q_flat = q[:, 0, :]              # [num_q, D]
-        ref_flat = reference_points[0]   # [num_q, 3]
-        refined, info = self.apr(
-            q_flat[alive_mask], ref_flat[alive_mask], velocity[alive_mask],
-            self.history_bev_feats, self.history_ego_r, self.history_ego_t,
-            cur_ego_r, cur_ego_t, time_delta, self.pc_range)
-        self.last_apr[tag] = {'info': info, 'alive_mask': alive_mask}
-        q_flat = q_flat.clone()
-        q_flat[alive_mask] = refined
-        return q_flat.unsqueeze(1)       # [num_q, 1, D]
 
     def _update_ref(self, reg_branch, output, reference_points, ref_size, detach_size):
         """Run regression head and update reference points and box sizes."""
@@ -495,17 +441,15 @@ class TransFusionTransformerDecoder(BaseModule):
             ref_size:         [B, num_q, 3]  wlh log space
             bev_feat:         [B, C_bev, H_bev, W_bev]
             alive_mask, velocity, cur_ego_r, cur_ego_t, time_delta:
-                per-frame values only ViP3D/track_instances has, needed by APR
-                (self.apr / self.history_*, both owned by this module — see
-                _run_apr / _push_apr_history above).
+                per-frame track/ego state passed through by ViP3D; accepted
+                for signature compatibility, unused by this decoder.
         """
         intermediate = []
         inter_ref = []
         inter_size = []
 
-        # Layer 0: LiDAR BEV cross-attention
-        q = self._run_apr(query, reference_points, alive_mask, velocity,
-                           cur_ego_r, cur_ego_t, time_delta, tag='l0')
+        # Layer 0: LiDAR BEV cross-attention.
+        q = query
         # self-attention
         q2, _ = self.sa0(q + query_pos, q + query_pos, q)
         q = self.n0[0](q + q2)
@@ -533,18 +477,11 @@ class TransFusionTransformerDecoder(BaseModule):
             intermediate.append(q)
             inter_ref.append(reference_points)
             inter_size.append(ref_size)
-            self._push_apr_history(bev_feat, cur_ego_r, cur_ego_t)
             return (torch.stack(intermediate),
                     torch.stack(inter_ref),
                     torch.stack(inter_size))
 
-        # second APR pass: layer 0 has already refined both position (reference_points,
-        # via _update_ref above) and content (q) — this call sees the improved version
-        # of both, before layer 1 ever samples the cameras.
-        q = self._run_apr(q, reference_points, alive_mask, velocity,
-                           cur_ego_r, cur_ego_t, time_delta, tag='l1')
-
-        q_layer0 = q.clone()  # pure layer 0 (+ 2nd APR pass) output, before layer 1
+        q_layer0 = q.clone()  # pure layer 0 output, before layer 1
 
         q2, _ = self.sa1(q + query_pos, q + query_pos, q)
         q = self.n1[0](q + q2)
@@ -572,7 +509,6 @@ class TransFusionTransformerDecoder(BaseModule):
         inter_ref.append(reference_points)
         inter_size.append(ref_size)
 
-        self._push_apr_history(bev_feat, cur_ego_r, cur_ego_t)
         return (torch.stack(intermediate),
                 torch.stack(inter_ref),
                 torch.stack(inter_size))

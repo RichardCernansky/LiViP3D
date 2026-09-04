@@ -2,6 +2,16 @@ from mmcv.runner import HOOKS, Hook
 
 
 def _set_object_sample_enabled(dataset, enabled):
+    # `runner.data_loader.dataset` is the CBGSDataset wrapper, which has no
+    # `pipeline_single`; looking for the transform on it directly finds
+    # nothing, so the fade silently never happened and pasting ran for the
+    # whole schedule. Unwrap to the dataset that actually holds the pipeline.
+    depth = 0
+    while dataset is not None and not hasattr(dataset, 'pipeline_single'):
+        dataset = getattr(dataset, 'dataset', None)
+        depth += 1
+        if depth > 4:
+            return
     pipeline = getattr(dataset, 'pipeline_single', None)
     if pipeline is None:
         return

@@ -23,6 +23,7 @@ from mmdet3d.core.bbox import Box3DMode, Coord3DMode, LiDARInstance3DBoxes
 from mmdet3d.core.bbox import get_box_type
 from mmdet3d.datasets.pipelines import Compose
 from . import utils
+from .pipeline import PASTE_SENTINEL_BASE
 
 
 @DATASETS.register_module()
@@ -364,7 +365,7 @@ class NuScenesTrackDatasetRadar(Dataset):
 
                 for box_idx, instance_idx in enumerate(instance_inds):
                     assert instance_idx != -1
-                    if instance_idx < 0:  # pasted-object sentinel, not a real tracked instance
+                    if instance_idx >= PASTE_SENTINEL_BASE:  # pasted-object sentinel, not a real tracked instance
                         continue
                     if instance_idx not in instance_idx_2_labels:
                         if i >= end:
